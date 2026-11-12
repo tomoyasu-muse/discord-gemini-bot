@@ -35,12 +35,15 @@ Discord + Gemini API chat bot.
   creates a 「ダイエット記録」 channel where every record is stored as
   a bot message (`DIETLOG|1|...`) tagged with its user, so logs
   survive redeploys with no database and stay separate per user.
-  Mention the bot with the food and calories written out
-  (「納豆ご飯 300kcal」) and the number is logged as-is; meals are
-  totalled per calendar day (00:00–24:00 JST) and each log reply
-  reports the day's intake against that user's daily goal. Without
-  calories, text starting with 食べた (or the `/meal` command) lets
-  Gemini estimate calories and PFC instead. 「体重 68.4」 (or
+  Write the food and calories (「納豆ご飯 300kcal」) in a mention
+  or the `/gohan` command and the numbers are logged as-is; the
+  parser also accepts several items at once (「マグロ200g 230kcal
+  パックご飯180kcal」) and a combined total in parentheses
+  (「ご飯、納豆、オクラ（400kcal）」). Meals are totalled per
+  calendar day (00:00–24:00 JST) and each log reply reports the
+  day's intake against that user's daily goal. Without calories,
+  the same inputs let Gemini estimate calories and PFC instead.
+  「体重 68.4」 (or
   `/weight`) logs weight. `/diet-goal` sets a per-user target weight
   and daily calorie goal, `/today` and `/week` summarise, and
   reminders post at 08:00 (weight) and 21:00 (missing logs; weekly
