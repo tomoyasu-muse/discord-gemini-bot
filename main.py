@@ -8,17 +8,20 @@ Discord + Gemini AI chat bot.
   mention is needed and the bot keeps a per-thread Gemini chat session.
 - Mentioning the bot inside any thread (re)activates that thread as a
   conversation thread.
-- Search: messages starting with 「調べて」 (or the /search command) are
-  answered by a separate search model with Google Search grounding,
-  with sources appended. Search has its own small daily quota.
+- Search: messages starting with 「調べて」 (or the /search command) run
+  a Tavily web search and the main model answers from the results,
+  with sources appended. If search is unavailable, the bot falls back
+  to a normal answer.
 - keep_alive: a small Flask server runs in a background thread so
   Render (and uptime pingers) have an HTTP endpoint to hit.
 """
 
 import asyncio
+import json
 import os
 import re
 import threading
+import urllib.request
 
 import discord
 import google.generativeai as genai
@@ -58,7 +61,7 @@ def keep_alive():
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
-SEARCH_MODEL = os.environ.get("SEARCH_MODEL", "gemini-2.5-flash-lite")
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 
 # Guild used for instant slash-command sync during testing.
 # Global sync also runs, so other guilds get /thread as it propagates.
@@ -95,45 +98,53 @@ async def ask_gemini_once(prompt: str) -> str:
     return text if text else "（応答が空でした。もう一度お試しください）"
 
 
-# --- Search (Google Search grounding on a separate, quota-limited model) ---
+# --- Search (Tavily web search; the main model answers from the results) ---
 SEARCH_TRIGGER_RE = re.compile(r"^(調べて|検索して)[\s:：、]*")
 
 
-def extract_sources(response) -> list[str]:
-    """Pull up to 3 source links out of a grounded response."""
-    sources: list[str] = []
-    seen: set[str] = set()
-    try:
-        candidates = response.candidates or []
-    except Exception:  # noqa: BLE001
-        return sources
-    for candidate in candidates[:1]:
-        metadata = getattr(candidate, "grounding_metadata", None)
-        chunks = getattr(metadata, "grounding_chunks", None) or []
-        for chunk in chunks:
-            web = getattr(chunk, "web", None)
-            uri = getattr(web, "uri", None)
-            if not uri or uri in seen:
-                continue
-            seen.add(uri)
-            title = getattr(web, "title", None)
-            sources.append(f"{title} {uri}" if title else uri)
-            if len(sources) >= 3:
-                return sources
-    return sources
+def _tavily_search_sync(query: str) -> list[dict]:
+    """One Tavily basic search. Raises on any failure."""
+    if not TAVILY_API_KEY:
+        raise RuntimeError("TAVILY_API_KEY is not set")
+    payload = json.dumps(
+        {"query": query, "max_results": 5, "search_depth": "basic"}
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        "https://api.tavily.com/search",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {TAVILY_API_KEY}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    return data.get("results", [])
 
 
 async def ask_gemini_search(prompt: str) -> str:
-    """Answer using the search model with Google Search grounding."""
-    model = genai.GenerativeModel(SEARCH_MODEL, tools="google_search_retrieval")
-    response = await asyncio.to_thread(model.generate_content, prompt)
-    try:
-        text = (response.text or "").strip()
-    except Exception:  # noqa: BLE001
-        text = ""
-    if not text:
-        text = "（応答が空でした。もう一度お試しください）"
-    sources = extract_sources(response)
+    """Search the web with Tavily, then answer from the results."""
+    results = await asyncio.to_thread(_tavily_search_sync, prompt)
+    if not results:
+        raise RuntimeError("Tavily returned no results")
+    context_parts = []
+    sources: list[str] = []
+    for index, result in enumerate(results, start=1):
+        title = result.get("title") or "(no title)"
+        url = result.get("url") or ""
+        content = (result.get("content") or "")[:600]
+        context_parts.append(f"[{index}] {title}\n{url}\n{content}")
+        if url and len(sources) < 3:
+            sources.append(f"{title} {url}")
+    composed = (
+        "あなたはWeb検索の結果に基づいて回答するアシスタントです。"
+        "以下の検索結果を根拠に、質問に日本語で簡潔に答えてください。"
+        "検索結果に無いことは推測で断言せず、分からないと述べてください。\n\n"
+        f"質問: {prompt}\n\n"
+        "検索結果:\n" + "\n\n".join(context_parts)
+    )
+    text = await ask_gemini_once(composed)
     if sources:
         text += "\n\n出典:\n" + "\n".join(f"- {s}" for s in sources)
     return text
@@ -250,7 +261,7 @@ async def thread_command(interaction: discord.Interaction, question: str):
     await interaction.followup.send(f"スレッドを作りました: {thread.mention}")
 
 
-@bot.tree.command(name="search", description="Web検索して最新情報で答えます（検索は1日20回まで）")
+@bot.tree.command(name="search", description="Web検索して最新情報で答えます")
 @app_commands.describe(question="調べたいこと")
 async def search_command(interaction: discord.Interaction, question: str):
     await interaction.response.defer(thinking=True)
