@@ -33,7 +33,9 @@ Discord + Gemini API chat bot.
   normal answer; a Gemini rate limit (429) is reported as such instead.
 - Diet support (`diet.py`): run `/diet-setup` once per server; it
   creates a 「ダイエット記録」 channel. Meal/weight records are
-  stored as bot messages (`DIETLOG|1|...`) tagged with their user,
+  stored as bot messages — a machine-readable `DIETLOG|1|...`
+  first line (tagged with their user) plus a human-readable
+  second line, so the channel reads as a shared multi-user log —
   while settings (config + goals) live in one pinned `DIETSET`
   message edited in place, so they never fall out of the history
   window. State is preloaded on startup; logs survive redeploys

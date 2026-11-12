@@ -21,9 +21,12 @@ late-night snack lands on the day it was eaten, not the next
 morning.
 
 Storage: there is no database. Each guild gets a text channel named
-「ダイエット記録」. Meal / weight records are one bot message each
-in a machine-readable one-line format (DIETLOG|1|...), tagged with
-the user they belong to. Settings (config + each user's goal) live
+「ダイエット記録」. Meal / weight records are one bot message each:
+a machine-readable first line (DIETLOG|1|...), tagged with the
+user they belong to, plus a human-readable second line
+(「🍽️ 12:30 名前： マグロ200g 230kcal・パックご飯 180kcal → 合計
+410kcal」) so the channel reads as a shared multi-user log. The
+loader only ever parses the first line. Settings (config + each user's goal) live
 in ONE pinned message (DIETSET|1 + DIETLOG lines) that is edited in
 place, so they never fall out of the history window. On startup the
 bot preloads every guild's channel (pins + recent history) and
@@ -113,6 +116,9 @@ def decode_record(content: str) -> dict | None:
     if len(parts) < 6:
         return None
     _tag, _ver, rtype, ts_raw, kv_raw, text = parts
+    # The record text is the first line only; anything after a
+    # newline is the human-readable display line.
+    text = text.split("\n", 1)[0]
     try:
         ts = datetime.datetime.fromisoformat(ts_raw)
     except ValueError:
@@ -362,9 +368,13 @@ async def _save_settings(guild: discord.Guild, state: GuildDiet):
 
 async def _append_record(guild: discord.Guild, state: GuildDiet,
                          rtype: str, fields: dict, text: str = "",
-                         user_id: int | None = None) -> dict:
+                         user_id: int | None = None,
+                         display: str | None = None) -> dict:
     """Post a meal/weight record as its own message in the log
-    channel (one message per record, items joined in the text)."""
+    channel (one message per record, items joined in the text).
+    `display`, when given, is appended as a human-readable second
+    line so the channel reads as a shared log; the loader ignores
+    everything after the first line."""
     channel = guild.get_channel(state.channel_id)
     if channel is None:
         raise RuntimeError("log channel not found")
@@ -372,6 +382,8 @@ async def _append_record(guild: discord.Guild, state: GuildDiet,
         fields = {"user": str(user_id), **fields}
     now = datetime.datetime.now(JST)
     content = encode_record(rtype, now, fields, text)
+    if display:
+        content += "\n" + _clean_field(display)
     message = await channel.send(content)
     record = decode_record(content)
     record["msg_id"] = message.id
@@ -666,11 +678,20 @@ SETUP_HINT = (
 )
 
 
-async def _record_manual(guild, state, user_id: int, parsed: dict) -> str:
+async def _record_manual(guild, state, user_id: int, parsed: dict,
+                         user_name: str = "") -> str:
+    now = datetime.datetime.now(JST)
+    who = f"{user_name}：" if user_name else ""
+    item_text = "・".join(
+        f"{name} {kcal}kcal" if kcal is not None else name
+        for name, kcal in parsed["items"])
+    display = f"🍽️ {now:%H:%M} {who}{item_text}"
+    if len(parsed["items"]) > 1 or parsed["items"][0][1] is None:
+        display += f" → 合計 {parsed['total']}kcal"
     await _append_record(
         guild, state, "meal",
         {"kcal": str(int(parsed["total"])), "manual": "1"},
-        parsed["name"], user_id=user_id)
+        parsed["name"], user_id=user_id, display=display)
     lines = ["🍽️ 記録しました"]
     for name, kcal in parsed["items"]:
         lines.append(f"- {name}：{kcal} kcal" if kcal is not None
@@ -682,7 +703,8 @@ async def _record_manual(guild, state, user_id: int, parsed: dict) -> str:
 
 
 async def _record_estimated(guild, state, user_id: int, est: dict,
-                            manual_items: list | None = None) -> str:
+                            manual_items: list | None = None,
+                            user_name: str = "") -> str:
     """Record a meal whose calories were (partly) estimated.
     manual_items, when given, are (name, kcal) pairs already known;
     they are added on top of the estimate."""
@@ -693,11 +715,15 @@ async def _record_estimated(guild, state, user_id: int, est: dict,
     if est["meal_name"]:
         names.append(est["meal_name"])
     name = "、".join(names) if names else "食事"
+    now = datetime.datetime.now(JST)
+    who = f"{user_name}：" if user_name else ""
+    suffix = "（一部推定）" if manual_items else "（推定）"
+    display = f"🍽️ {now:%H:%M} {who}{name} {total_kcal:.0f}kcal{suffix}"
     await _append_record(
         guild, state, "meal",
         {"kcal": f"{total_kcal:.0f}", "p": f"{totals['p']:.1f}",
          "f": f"{totals['f']:.1f}", "c": f"{totals['c']:.1f}"},
-        name, user_id=user_id,
+        name, user_id=user_id, display=display,
     )
     lines = ["🍽️ 記録しました"]
     for item_name, kcal in (manual_items or []):
@@ -938,7 +964,8 @@ def register(bot: commands.Bot):
         parsed = parse_meal_input(text)
         if parsed:
             reply = await _record_manual(
-                guild, state, interaction.user.id, parsed)
+                guild, state, interaction.user.id, parsed,
+                user_name=interaction.user.display_name)
             await interaction.followup.send(reply)
             return
         partial = parse_partial_input(text)
@@ -952,7 +979,8 @@ def register(bot: commands.Bot):
                     return
                 reply = await _record_estimated(
                     guild, state, interaction.user.id, est,
-                    manual_items=partial["manual_items"])
+                    manual_items=partial["manual_items"],
+                    user_name=interaction.user.display_name)
                 await interaction.followup.send(reply)
                 return
             est = await estimate_meal_text(text)
@@ -968,7 +996,8 @@ def register(bot: commands.Bot):
                 "カロリーが分かれば「納豆ご飯 300kcal」の形式で記録できます。")
             return
         reply = await _record_estimated(
-            guild, state, interaction.user.id, est)
+            guild, state, interaction.user.id, est,
+            user_name=interaction.user.display_name)
         await interaction.followup.send(reply)
 
     @tree.command(name="weight", description="体重を記録")
@@ -989,8 +1018,13 @@ def register(bot: commands.Bot):
                 "体重の数値が範囲外のようです。", ephemeral=True)
             return
         prev = state.latest_weight(interaction.user.id)
+        now = datetime.datetime.now(JST)
+        display = (f"⚖️ {now:%H:%M} {interaction.user.display_name}："
+                   f"体重 {kg:.1f}kg")
+        if prev:
+            display += f"（前回比 {kg - _f(prev['fields'], 'kg'):+.1f}）"
         await _append_record(guild, state, "weight", {"kg": f"{kg:.1f}"},
-                             user_id=interaction.user.id)
+                             user_id=interaction.user.id, display=display)
         line = f"⚖️ 体重を記録しました： {kg:.1f} kg"
         if prev:
             line += f"（前回 {_f(prev['fields'], 'kg'):.1f} kg から {kg - _f(prev['fields'], 'kg'):+.1f} kg）"
