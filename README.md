@@ -3,10 +3,13 @@
 Discord + Gemini API chat bot.
 
 ## Behaviour
-- Mention the bot in a normal channel -> it creates a new thread named after
-  the sender and answers there.
-- Inside that thread, no mention is needed; the conversation continues with
-  per-thread Gemini chat history.
+- Mention the bot in a normal channel -> it answers with a one-shot reply
+  in that same channel. No thread is created and no history is kept.
+- Use the `/thread` slash command with a question -> it creates a thread
+  and answers inside it. Inside that thread, no mention is needed; the
+  conversation continues with per-thread Gemini chat history.
+- Mentioning the bot inside any thread (re)activates that thread as a
+  conversation thread.
 - A Flask keep-alive server listens on port 8080 (`/` and `/health`).
 
 ## Environment variables
