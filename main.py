@@ -8,15 +8,16 @@ Discord + Gemini AI chat bot.
   mention is needed and the bot keeps a per-thread Gemini chat session.
 - Mentioning the bot inside any thread (re)activates that thread as a
   conversation thread.
-- Search: messages starting with 「調べて」 (or the /search command) run
-  a Tavily web search and the main model answers from the results,
-  with sources appended. If search is unavailable, the bot falls back
-  to a normal answer.
+- Search: messages starting with 「調べて」 (or the /search command) let
+  the model use Tavily tools (web search, plus full-page extraction
+  when a snippet is not enough) and answer with cited source URLs.
+  If search is unavailable, the bot falls back to a normal answer.
 - keep_alive: a small Flask server runs in a background thread so
   Render (and uptime pingers) have an HTTP endpoint to hit.
 """
 
 import asyncio
+import contextvars
 import json
 import os
 import re
@@ -98,55 +99,142 @@ async def ask_gemini_once(prompt: str) -> str:
     return text if text else "（応答が空でした。もう一度お試しください）"
 
 
-# --- Search (Tavily web search; the main model answers from the results) ---
+# --- Search (Tavily tools driven by Gemini automatic function calling) ---
 SEARCH_TRIGGER_RE = re.compile(r"^(調べて|検索して)[\s:：、]*")
 
+SEARCH_SYSTEM_INSTRUCTION = (
+    "あなたはWeb検索ツールを使って最新情報を調べるアシスタントです。"
+    "回答する前に、必ず search_web ツールで検索してください。"
+    "検索結果のスニペットだけでは情報が不十分な場合は、extract_page ツールで"
+    "該当ページの全文を読んでから答えてください。"
+    "事実に関する主張には、根拠となったページのURLを引用として必ず含めてください。"
+    "URLはツールの結果に実際に含まれるものだけを使い、存在しないURLを創作してはいけません。"
+    "回答は日本語で簡潔にまとめてください。"
+)
 
-def _tavily_search_sync(query: str) -> list[dict]:
-    """One Tavily basic search. Raises on any failure."""
+# URLs actually returned by the tools during the current search request:
+# list of (title, url). Used to append a guaranteed-real source list.
+_current_sources: contextvars.ContextVar = contextvars.ContextVar(
+    "current_sources", default=None
+)
+
+
+def _collect_source(title: str, url: str):
+    sources = _current_sources.get()
+    if sources is None or not url:
+        return
+    if any(existing_url == url for _, existing_url in sources):
+        return
+    sources.append((title or url, url))
+
+
+def _tavily_post(path: str, payload: dict) -> dict:
     if not TAVILY_API_KEY:
         raise RuntimeError("TAVILY_API_KEY is not set")
-    payload = json.dumps(
-        {"query": query, "max_results": 5, "search_depth": "basic"}
-    ).encode("utf-8")
     request = urllib.request.Request(
-        "https://api.tavily.com/search",
-        data=payload,
+        f"https://api.tavily.com{path}",
+        data=json.dumps(payload).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {TAVILY_API_KEY}",
         },
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        data = json.loads(response.read().decode("utf-8"))
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _tavily_search_sync(query: str, search_depth: str, topic: str) -> list[dict]:
+    data = _tavily_post(
+        "/search",
+        {
+            "query": query,
+            "max_results": 5,
+            "search_depth": search_depth,
+            "topic": topic,
+        },
+    )
     return data.get("results", [])
 
 
-async def ask_gemini_search(prompt: str) -> str:
-    """Search the web with Tavily, then answer from the results."""
-    results = await asyncio.to_thread(_tavily_search_sync, prompt)
+def search_web(query: str, search_depth: str = "basic", topic: str = "general") -> str:
+    """Search the web for current information.
+
+    Args:
+        query: What to search for.
+        search_depth: "basic" (default, 1 credit) or "advanced"
+            (2 credits, deeper search; use only when basic detail is
+            unlikely to be enough).
+        topic: "general" (default) or "news" (for recent news).
+
+    Returns:
+        Search results as text: title, URL and a snippet per result.
+    """
+    if search_depth not in ("basic", "advanced"):
+        search_depth = "basic"
+    if topic not in ("general", "news"):
+        topic = "general"
+    results = _tavily_search_sync(query, search_depth, topic)
     if not results:
-        raise RuntimeError("Tavily returned no results")
-    context_parts = []
-    sources: list[str] = []
+        return "検索結果は見つかりませんでした。クエリを変えて再検索できます。"
+    parts = []
     for index, result in enumerate(results, start=1):
         title = result.get("title") or "(no title)"
         url = result.get("url") or ""
         content = (result.get("content") or "")[:600]
-        context_parts.append(f"[{index}] {title}\n{url}\n{content}")
-        if url and len(sources) < 3:
-            sources.append(f"{title} {url}")
-    composed = (
-        "あなたはWeb検索の結果に基づいて回答するアシスタントです。"
-        "以下の検索結果を根拠に、質問に日本語で簡潔に答えてください。"
-        "検索結果に無いことは推測で断言せず、分からないと述べてください。\n\n"
-        f"質問: {prompt}\n\n"
-        "検索結果:\n" + "\n\n".join(context_parts)
-    )
-    text = await ask_gemini_once(composed)
+        _collect_source(title, url)
+        parts.append(f"[{index}] {title}\n{url}\n{content}")
+    return "\n\n".join(parts)
+
+
+def extract_page(url: str) -> str:
+    """Read the full text of one web page (for example from search_web).
+
+    Use this when a search snippet is not enough to answer accurately.
+
+    Args:
+        url: The page URL to read.
+
+    Returns:
+        The page content as Markdown text (truncated if very long).
+    """
+    data = _tavily_post("/extract", {"urls": [url], "extract_depth": "basic"})
+    results = data.get("results", [])
+    if not results:
+        return "ページの内容を取得できませんでした。"
+    first = results[0]
+    _collect_source(first.get("title") or url, url)
+    text = first.get("raw_content") or first.get("content") or ""
+    return text[:4000] if text else "ページの内容を取得できませんでした。"
+
+
+async def ask_gemini_search(prompt: str) -> str:
+    """Answer with web search: the model drives the Tavily tools itself,
+    then writes an answer citing the URLs it actually used."""
+    if not TAVILY_API_KEY:
+        raise RuntimeError("TAVILY_API_KEY is not set")
+    sources: list = []
+    token = _current_sources.set(sources)
+    try:
+        model = genai.GenerativeModel(
+            GEMINI_MODEL,
+            system_instruction=SEARCH_SYSTEM_INSTRUCTION,
+            tools=[search_web, extract_page],
+        )
+        chat = model.start_chat(history=[], enable_automatic_function_calling=True)
+        response = await asyncio.to_thread(chat.send_message, prompt)
+    finally:
+        _current_sources.reset(token)
+    try:
+        text = (response.text or "").strip()
+    except Exception:  # noqa: BLE001
+        text = ""
+    if not text:
+        text = "（応答が空でした。もう一度お試しください）"
     if sources:
-        text += "\n\n出典:\n" + "\n".join(f"- {s}" for s in sources)
+        text += "\n\n出典:\n" + "\n".join(
+            f"- {title} {url}" for title, url in sources[:5]
+        )
     return text
 
 

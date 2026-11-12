@@ -11,9 +11,13 @@ Discord + Gemini API chat bot.
 - Mentioning the bot inside any thread (re)activates that thread as a
   conversation thread.
 - Search: start a message with 「調べて」 (or use the `/search` command)
-  and the bot runs a Tavily web search, then the main model answers
-  from the results; sources are appended to the answer. Tavily's free
-  plan allows 1,000 searches/month and needs no credit card. If a
+  and the model itself drives Tavily tools through Gemini function
+  calling: `search_web` (basic search = 1 credit; the model may choose
+  advanced/news search when warranted) and `extract_page` (reads a
+  full page when a snippet is not enough). A system instruction makes
+  it cite only URLs that actually came back from the tools, and the
+  bot also appends the real source list it collected. Tavily's free
+  plan allows 1,000 credits/month and needs no credit card. If a
   search fails (or no API key is configured), the bot falls back to a
   normal answer.
 - A Flask keep-alive server listens on port 8080 (`/` and `/health`).
