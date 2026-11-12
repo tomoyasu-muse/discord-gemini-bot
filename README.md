@@ -18,10 +18,12 @@ Discord + Gemini API chat bot.
   embeds the current JST date/time so queries stay recency-aware, and
   the model must cite only URLs that actually came back from the
   tools; when the answer contains no URL, the bot appends the real
-  source list it collected. Tavily's free plan allows 1,000
-  credits/month and needs no credit card. If a search fails (or no API
-  key is configured), the bot falls back to a normal answer; a Gemini
-  rate limit (429) is reported as such instead.
+  source list it collected. Questions that clearly need real-time data
+  (weather, FX rates, stock prices, news…) are auto-detected by a
+  keyword regex — no 「調べて」 needed — and use a faster pre-fetch
+  route (Python searches Tavily once, then one Gemini call). Tavily's free plan allows 1,000 credits/month and needs no credit card. If a
+  search fails (or no API key is configured), the bot falls back to a
+  normal answer; a Gemini rate limit (429) is reported as such instead.
 - Gemini is called via the google-genai SDK's async client
   (`client.aio`) and Tavily via `AsyncTavilyClient`, so API calls
   never block the Discord event loop.

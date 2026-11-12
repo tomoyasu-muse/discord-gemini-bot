@@ -11,8 +11,12 @@ Discord + Gemini AI chat bot.
 - Search: messages starting with 「調べて」 (or the /search command) let
   the model use Tavily tools (web search, a dedicated news search,
   plus full-page extraction when a snippet is not enough) and answer
-  with cited source URLs. If search is unavailable, the bot falls back
-  to a normal answer (except on rate limits, where it says so).
+  with cited source URLs. Questions that clearly need real-time data
+  (weather, FX, stock prices, news…) are auto-detected by a keyword
+  regex and answered through a faster pre-fetch route instead: Python
+  searches Tavily once, then asks Gemini once with the results.
+  If search is unavailable, the bot falls back to a normal answer
+  (except on rate limits, where it says so).
 - Gemini is called through the google-genai SDK's async client
   (client.aio) and Tavily through AsyncTavilyClient, so no call ever
   blocks the Discord event loop.
@@ -154,6 +158,23 @@ async def ask_gemini_once(prompt: str) -> str:
 # --- Search (Tavily tools driven by Gemini automatic function calling) ---
 SEARCH_TRIGGER_RE = re.compile(r"^(調べて|検索して)[\s:：、]*")
 
+# Auto pre-fetch routing: questions that clearly need real-time data are
+# searched by Python directly (one Tavily call + one Gemini call), which
+# is faster and cheaper than the function-calling route. The keywords are
+# deliberately topic words only — bare time words (今日, いま, 今年…) are
+# NOT triggers, so everyday chat is never slowed down and the monthly
+# Tavily credit budget is not burned on small talk.
+REALTIME_PATTERN = re.compile(
+    r"(天気|気温|降水確率|雨が降|雨降る|雪が降|雪降る|台風|地震|津波|"
+    r"ドル円|円相場|円安|円高|為替|ビットコイン|仮想通貨|"
+    r"株価|日経平均|ダウ平均|ナスダック|決算発表|"
+    r"ニュース|速報|"
+    r"試合結果|試合の結果|順位表|"
+    r"運休|運転見合わせ|渋滞情報|"
+    r"ググって|調べて|検索して)"
+)
+NEWS_PATTERN = re.compile(r"(ニュース|速報|事件|事故|トレンド)")
+
 
 def build_search_system_instruction() -> str:
     """System instruction for search answers, with the current JST
@@ -172,6 +193,20 @@ def build_search_system_instruction() -> str:
         "事実に関する主張には、根拠となったページへのリンクを "
         "[タイトル](<URL>) の形式で必ず含めてください。"
         "URLはツールの結果に実際に含まれるものだけを使い、存在しないURLを創作してはいけません。"
+        "回答は日本語で簡潔にまとめてください。"
+    )
+
+
+def build_prefetch_system_instruction() -> str:
+    """System instruction for the pre-fetch route, where Python has
+    already searched and the model just answers from the results."""
+    return (
+        f"現在の日時は {now_str_jst()}（日本時間）です。"
+        "ユーザーの質問と、それに対するWeb検索結果が渡されます。"
+        "天気・為替・株価などのリアルタイムな情報は、検索結果の内容を優先して答えてください。"
+        "もし検索結果に質問と関係ない情報しかない場合は、検索結果を無視して"
+        "一般的な知識で普通に答えてください。"
+        "出典を示すときは [タイトル](<URL>) の形式で、検索結果に含まれるURLだけを使ってください。"
         "回答は日本語で簡潔にまとめてください。"
     )
 
@@ -342,26 +377,81 @@ async def ask_gemini_search(prompt: str) -> str:
     return text
 
 
-async def answer_with_optional_search(prompt: str, normal_ask):
-    """Route 「調べて…」 prompts to search; fall back to a normal answer.
+async def ask_gemini_prefetch(prompt: str) -> str:
+    """Pre-fetch route for real-time questions: Python searches Tavily
+    once, then asks Gemini once with the results attached. No function
+    calling, so this is the fastest search path (1 Tavily credit +
+    1 Gemini call)."""
+    if tavily_client is None:
+        raise RuntimeError("TAVILY_API_KEY is not set")
+    sources: list = []
+    token = _current_sources.set(sources)
+    try:
+        if NEWS_PATTERN.search(prompt):
+            results_text = await search_news(prompt, days=3)
+        else:
+            today = datetime.datetime.now(
+                zoneinfo.ZoneInfo("Asia/Tokyo")
+            ).strftime("%Y年%m月%d日")
+            results_text = await search_web(f"{prompt}（{today} 現在）")
+    finally:
+        _current_sources.reset(token)
+    contents = (
+        "以下のWeb検索結果をもとに、ユーザーの質問に回答してください。\n\n"
+        f"【ユーザーの質問】\n{prompt}\n\n"
+        f"【Web検索結果】\n{results_text}"
+    )
+    response = await gemini_client.aio.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=build_prefetch_system_instruction(),
+            max_output_tokens=2048,
+        ),
+    )
+    text = _clean_text(response)
+    if sources and "http" not in text:
+        text += "\n\n出典:\n" + "\n".join(
+            f"- [{title}](<{url}>)" for title, url in sources[:5]
+        )
+    return text
 
-    normal_ask is an async callable taking the prompt, used both for
-    non-search prompts and as the fallback when search fails. A Gemini
-    rate limit (429) is re-raised instead of falling back, because the
-    fallback call would hit the same limit.
+
+async def answer_with_optional_search(prompt: str, normal_ask):
+    """Three-way routing (decided by regex in well under a millisecond,
+    so normal chat pays no latency):
+
+    - Starts with 「調べて」 -> the agentic function-calling search
+      (deepest research; falls back to a normal answer on failure).
+    - Clearly real-time topic (REALTIME_PATTERN: weather, FX, stocks,
+      news…) -> the pre-fetch search (fast: 1 Tavily + 1 Gemini call;
+      silently falls back to a normal answer on failure).
+    - Anything else -> the normal answer as-is.
+
+    normal_ask is an async callable taking the prompt. A Gemini rate
+    limit (429) is re-raised on every route, because a fallback call
+    would hit the same limit.
     """
     match = SEARCH_TRIGGER_RE.match(prompt)
-    if not match:
-        return await normal_ask(prompt)
-    query = prompt[match.end():].strip() or prompt
-    try:
-        return await ask_gemini_search(query)
-    except Exception as exc:  # noqa: BLE001
-        if is_rate_limit(exc):
-            raise
-        print(f"Search failed, falling back: {exc}")
-        base = await normal_ask(prompt)
-        return "（検索できませんでした。通常の回答です）\n" + base
+    if match:
+        query = prompt[match.end():].strip() or prompt
+        try:
+            return await ask_gemini_search(query)
+        except Exception as exc:  # noqa: BLE001
+            if is_rate_limit(exc):
+                raise
+            print(f"Search failed, falling back: {exc}")
+            base = await normal_ask(prompt)
+            return "（検索できませんでした。通常の回答です）\n" + base
+    if REALTIME_PATTERN.search(prompt):
+        try:
+            return await ask_gemini_prefetch(prompt)
+        except Exception as exc:  # noqa: BLE001
+            if is_rate_limit(exc):
+                raise
+            print(f"Prefetch failed, falling back: {exc}")
+            return await normal_ask(prompt)
+    return await normal_ask(prompt)
 
 
 def split_message(text: str, limit: int = 2000) -> list[str]:
