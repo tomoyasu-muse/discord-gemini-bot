@@ -8,12 +8,16 @@ Discord + Gemini AI chat bot.
   mention is needed and the bot keeps a per-thread Gemini chat session.
 - Mentioning the bot inside any thread (re)activates that thread as a
   conversation thread.
+- Search: messages starting with 「調べて」 (or the /search command) are
+  answered by a separate search model with Google Search grounding,
+  with sources appended. Search has its own small daily quota.
 - keep_alive: a small Flask server runs in a background thread so
   Render (and uptime pingers) have an HTTP endpoint to hit.
 """
 
 import asyncio
 import os
+import re
 import threading
 
 import discord
@@ -54,6 +58,7 @@ def keep_alive():
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+SEARCH_MODEL = os.environ.get("SEARCH_MODEL", "gemini-2.5-flash-lite")
 
 # Guild used for instant slash-command sync during testing.
 # Global sync also runs, so other guilds get /thread as it propagates.
@@ -88,6 +93,69 @@ async def ask_gemini_once(prompt: str) -> str:
     response = await asyncio.to_thread(model.generate_content, prompt)
     text = (response.text or "").strip()
     return text if text else "（応答が空でした。もう一度お試しください）"
+
+
+# --- Search (Google Search grounding on a separate, quota-limited model) ---
+SEARCH_TRIGGER_RE = re.compile(r"^(調べて|検索して)[\s:：、]*")
+
+
+def extract_sources(response) -> list[str]:
+    """Pull up to 3 source links out of a grounded response."""
+    sources: list[str] = []
+    seen: set[str] = set()
+    try:
+        candidates = response.candidates or []
+    except Exception:  # noqa: BLE001
+        return sources
+    for candidate in candidates[:1]:
+        metadata = getattr(candidate, "grounding_metadata", None)
+        chunks = getattr(metadata, "grounding_chunks", None) or []
+        for chunk in chunks:
+            web = getattr(chunk, "web", None)
+            uri = getattr(web, "uri", None)
+            if not uri or uri in seen:
+                continue
+            seen.add(uri)
+            title = getattr(web, "title", None)
+            sources.append(f"{title} {uri}" if title else uri)
+            if len(sources) >= 3:
+                return sources
+    return sources
+
+
+async def ask_gemini_search(prompt: str) -> str:
+    """Answer using the search model with Google Search grounding."""
+    model = genai.GenerativeModel(SEARCH_MODEL, tools="google_search_retrieval")
+    response = await asyncio.to_thread(model.generate_content, prompt)
+    try:
+        text = (response.text or "").strip()
+    except Exception:  # noqa: BLE001
+        text = ""
+    if not text:
+        text = "（応答が空でした。もう一度お試しください）"
+    sources = extract_sources(response)
+    if sources:
+        text += "\n\n出典:\n" + "\n".join(f"- {s}" for s in sources)
+    return text
+
+
+async def answer_with_optional_search(prompt: str, normal_ask):
+    """Route 「調べて…」 prompts to search; fall back to a normal answer.
+
+    normal_ask is an async callable taking the prompt, used both for
+    non-search prompts and as the fallback when search fails (for
+    example when the search model's daily quota is exhausted).
+    """
+    match = SEARCH_TRIGGER_RE.match(prompt)
+    if not match:
+        return await normal_ask(prompt)
+    query = prompt[match.end():].strip() or prompt
+    try:
+        return await ask_gemini_search(query)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Search failed, falling back: {exc}")
+        base = await normal_ask(prompt)
+        return "（検索できませんでした。通常の回答です）\n" + base
 
 
 def split_message(text: str, limit: int = 2000) -> list[str]:
@@ -182,6 +250,29 @@ async def thread_command(interaction: discord.Interaction, question: str):
     await interaction.followup.send(f"スレッドを作りました: {thread.mention}")
 
 
+@bot.tree.command(name="search", description="Web検索して最新情報で答えます（検索は1日20回まで）")
+@app_commands.describe(question="調べたいこと")
+async def search_command(interaction: discord.Interaction, question: str):
+    await interaction.response.defer(thinking=True)
+    try:
+        reply = await ask_gemini_search(question)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Search failed, falling back: {exc}")
+        try:
+            base = await ask_gemini_once(question)
+            reply = "（検索できませんでした。通常の回答です）\n" + base
+        except Exception as exc2:  # noqa: BLE001
+            print(f"Gemini error: {exc2}")
+            await interaction.followup.send(
+                "エラーが発生しました。しばらくしてからもう一度お試しください。"
+            )
+            return
+    chunks = split_message(reply)
+    await interaction.followup.send(chunks[0])
+    for chunk in chunks[1:]:
+        await interaction.channel.send(chunk)
+
+
 @bot.event
 async def on_message(message: discord.Message):
     # Ignore our own messages and other bots
@@ -204,7 +295,9 @@ async def on_message(message: discord.Message):
             return
         async with message.channel.typing():
             try:
-                reply = await ask_gemini(message.channel.id, prompt)
+                reply = await answer_with_optional_search(
+                    prompt, lambda p: ask_gemini(message.channel.id, p)
+                )
             except Exception as exc:  # noqa: BLE001
                 print(f"Gemini error: {exc}")
                 await message.channel.send("エラーが発生しました。しばらくしてからもう一度お試しください。")
@@ -225,7 +318,9 @@ async def on_message(message: discord.Message):
         active_threads.add(message.channel.id)
         async with message.channel.typing():
             try:
-                reply = await ask_gemini(message.channel.id, prompt)
+                reply = await answer_with_optional_search(
+                    prompt, lambda p: ask_gemini(message.channel.id, p)
+                )
             except Exception as exc:  # noqa: BLE001
                 print(f"Gemini error: {exc}")
                 await message.channel.send("エラーが発生しました。しばらくしてからもう一度お試しください。")
@@ -237,7 +332,7 @@ async def on_message(message: discord.Message):
     # --- In a normal channel: one-shot answer in the same channel ---
     async with message.channel.typing():
         try:
-            reply = await ask_gemini_once(prompt)
+            reply = await answer_with_optional_search(prompt, ask_gemini_once)
         except Exception as exc:  # noqa: BLE001
             print(f"Gemini error: {exc}")
             await message.channel.send("エラーが発生しました。しばらくしてからもう一度お試しください。")
