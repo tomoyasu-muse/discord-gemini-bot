@@ -48,7 +48,8 @@ Discord + Gemini API chat bot.
   parser also accepts several items at once (「マグロ200g 230kcal
   パックご飯180kcal」) and a combined total in parentheses
   (「ご飯、納豆、オクラ（400kcal）」). Meals are totalled per
-  calendar day (00:00–24:00 JST) and each log reply reports the
+  logical day (04:00–04:00 JST; entries before 04:00 count as
+  the previous day) and each log reply reports the
   day's intake against that user's daily goal. Without calories,
   the same inputs let Gemini estimate calories and PFC instead.
   `/weight` logs weight. `/diet-goal` sets a per-user target weight

@@ -10,10 +10,15 @@ first, and the parser accepts several items at once
 (「マグロ200g 230kcal パックご飯180kcal」), a combined total in
 parentheses (「ご飯、納豆、オクラ（400kcal）」), mixed known/unknown
 items (known calories are taken as-is, the rest is estimated), and
-half-/full-width variants. Meals are totalled per calendar day
-(00:00–24:00 JST) and every log reply reports the day's intake so
+half-/full-width variants. Meals are totalled per logical day
+(see below) and every log reply reports the day's intake so
 far. If the calories are unknown, Gemini estimates calories and
 PFC instead (totals are always summed in Python).
+
+Days run 04:00–04:00 JST, not midnight to midnight: anything
+logged between 00:00 and 03:59 counts as the previous day, so a
+late-night snack lands on the day it was eaten, not the next
+morning.
 
 Storage: there is no database. Each guild gets a text channel named
 「ダイエット記録」. Meal / weight records are one bot message each
@@ -49,6 +54,19 @@ from discord.ext import commands, tasks
 from google.genai import types
 
 JST = zoneinfo.ZoneInfo("Asia/Tokyo")
+# A diet "day" starts at 04:00 JST; 00:00–03:59 belongs to the
+# previous day (late-night snacks, pre-dawn weigh-ins).
+DAY_BOUNDARY_HOUR = 4
+
+
+def _logical_date(ts: datetime.datetime) -> datetime.date:
+    return (ts - datetime.timedelta(hours=DAY_BOUNDARY_HOUR)).date()
+
+
+def _today_logical() -> datetime.date:
+    return _logical_date(datetime.datetime.now(JST))
+
+
 LOG_CHANNEL_NAME = "ダイエット記録"
 RECORD_PREFIX = "DIETLOG|1|"
 SETTINGS_HEADER = "DIETSET|1"
@@ -176,7 +194,7 @@ class GuildDiet:
     def meals_on(self, day: datetime.date, user_id: int) -> list[dict]:
         return self._mine([
             r for r in self.records
-            if r["type"] == "meal" and r["ts"].astimezone(JST).date() == day
+            if r["type"] == "meal" and _logical_date(r["ts"]) == day
         ], user_id)
 
     def weights(self, user_id: int) -> list[dict]:
@@ -427,7 +445,7 @@ async def estimate_meal_text(description: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Summaries (per user; days are JST calendar days, 00:00–24:00)
+# Summaries (per user; days are logical days, 04:00–04:00 JST)
 # ---------------------------------------------------------------------------
 def _fmt_pfc(t: dict) -> str:
     return (f"{t['kcal']:.0f} kcal"
@@ -436,7 +454,7 @@ def _fmt_pfc(t: dict) -> str:
 
 def _today_line(state: GuildDiet, user_id: int) -> str:
     """The standing status line appended after every log entry."""
-    today = datetime.datetime.now(JST).date()
+    today = _today_logical()
     total = sum(_f(m["fields"], "kcal")
                 for m in state.meals_on(today, user_id))
     line = f"今日の摂取カロリーは合計 {total:.0f} kcal です"
@@ -452,7 +470,7 @@ def _today_line(state: GuildDiet, user_id: int) -> str:
 
 
 def today_summary(state: GuildDiet, user_id: int) -> str:
-    today = datetime.datetime.now(JST).date()
+    today = _today_logical()
     meals = state.meals_on(today, user_id)
     lines = [f"📊 今日（{today:%m/%d}）の記録"]
     if meals:
@@ -491,7 +509,7 @@ def today_summary(state: GuildDiet, user_id: int) -> str:
 
 
 def week_summary(state: GuildDiet, user_id: int) -> str:
-    today = datetime.datetime.now(JST).date()
+    today = _today_logical()
     lines = [f"📈 直近7日間（{today - datetime.timedelta(days=6):%m/%d}〜{today:%m/%d}）"]
     day_totals = []
     for offset in range(7):
@@ -864,7 +882,7 @@ def register(bot: commands.Bot):
             "　分かる品にはカロリーを付け、分からない品はそのまま書けばAIが推定します\n"
             "- 体重： /weight で記録します\n"
             "- 目標： /diet-goal で目標体重と1日の目標カロリーを設定\n"
-            "- 集計： /today（今日）・/week（直近7日）。集計は0時〜24時単位です\n"
+            "- 集計： /today（今日）・/week（直近7日）。1日は朝4時〜翌朝4時で集計します（深夜4時までの夜食は前日分）\n"
             "- 取り消し： /diet-undo で直前の食事・体重の記録を1件削除できます\n"
             "- リマインド： 朝8時に体重、夜21時に記録もれの声かけ（/diet-remind で切替）"
         )
@@ -1095,7 +1113,7 @@ async def _reminder_loop():
     if kind is None or _bot is None:
         return
     today_key = now.date().isoformat()
-    today = now.date()
+    today = _logical_date(now)
     for guild in list(_bot.guilds):
         key = (guild.id, today_key, kind)
         if key in _reminded:
