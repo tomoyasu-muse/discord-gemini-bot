@@ -18,11 +18,13 @@ Discord + Gemini AI chat bot.
 
 import asyncio
 import contextvars
+import datetime
 import json
 import os
 import re
 import threading
 import urllib.request
+import zoneinfo
 
 import discord
 import google.generativeai as genai
@@ -107,6 +109,9 @@ SEARCH_SYSTEM_INSTRUCTION = (
     "回答する前に、必ず search_web ツールで検索してください。"
     "検索結果のスニペットだけでは情報が不十分な場合は、extract_page ツールで"
     "該当ページの全文を読んでから答えてください。"
+    "ニュース・今日・最新の話題を聞かれた場合は、search_web で topic='news' と"
+    "time_range='day'（取れなければ 'week'）を指定し、古い日付の記事を"
+    "「今日のニュース」として扱わないでください。"
     "事実に関する主張には、根拠となったページのURLを引用として必ず含めてください。"
     "URLはツールの結果に実際に含まれるものだけを使い、存在しないURLを創作してはいけません。"
     "回答は日本語で簡潔にまとめてください。"
@@ -122,6 +127,9 @@ _current_sources: contextvars.ContextVar = contextvars.ContextVar(
 def _collect_source(title: str, url: str):
     sources = _current_sources.get()
     if sources is None or not url:
+        return
+    # A search-engine results page is not a source.
+    if "google.com/search" in url or "bing.com/search" in url:
         return
     if any(existing_url == url for _, existing_url in sources):
         return
@@ -144,20 +152,27 @@ def _tavily_post(path: str, payload: dict) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
-def _tavily_search_sync(query: str, search_depth: str, topic: str) -> list[dict]:
-    data = _tavily_post(
-        "/search",
-        {
-            "query": query,
-            "max_results": 5,
-            "search_depth": search_depth,
-            "topic": topic,
-        },
-    )
+def _tavily_search_sync(
+    query: str, search_depth: str, topic: str, time_range: str = ""
+) -> list[dict]:
+    payload = {
+        "query": query,
+        "max_results": 5,
+        "search_depth": search_depth,
+        "topic": topic,
+    }
+    if time_range:
+        payload["time_range"] = time_range
+    data = _tavily_post("/search", payload)
     return data.get("results", [])
 
 
-def search_web(query: str, search_depth: str = "basic", topic: str = "general") -> str:
+def search_web(
+    query: str,
+    search_depth: str = "basic",
+    topic: str = "general",
+    time_range: str = "",
+) -> str:
     """Search the web for current information.
 
     Args:
@@ -166,6 +181,9 @@ def search_web(query: str, search_depth: str = "basic", topic: str = "general") 
             (2 credits, deeper search; use only when basic detail is
             unlikely to be enough).
         topic: "general" (default) or "news" (for recent news).
+        time_range: Optional recency filter: "day", "week", "month"
+            or "year". For questions about today or the latest news,
+            use topic="news" with time_range="day" (or "week").
 
     Returns:
         Search results as text: title, URL and a snippet per result.
@@ -174,7 +192,9 @@ def search_web(query: str, search_depth: str = "basic", topic: str = "general") 
         search_depth = "basic"
     if topic not in ("general", "news"):
         topic = "general"
-    results = _tavily_search_sync(query, search_depth, topic)
+    if time_range not in ("", "day", "week", "month", "year"):
+        time_range = ""
+    results = _tavily_search_sync(query, search_depth, topic, time_range)
     if not results:
         return "検索結果は見つかりませんでした。クエリを変えて再検索できます。"
     parts = []
@@ -222,7 +242,9 @@ async def ask_gemini_search(prompt: str) -> str:
             tools=[search_web, extract_page],
         )
         chat = model.start_chat(history=[], enable_automatic_function_calling=True)
-        response = await asyncio.to_thread(chat.send_message, prompt)
+        today = datetime.datetime.now(zoneinfo.ZoneInfo("Asia/Tokyo")).date()
+        dated_prompt = f"（今日は {today.isoformat()} です）\n{prompt}"
+        response = await asyncio.to_thread(chat.send_message, dated_prompt)
     finally:
         _current_sources.reset(token)
     try:
