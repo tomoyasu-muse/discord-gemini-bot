@@ -283,6 +283,7 @@ async def ask_gemini_search(prompt: str) -> str:
             GEMINI_MODEL,
             system_instruction=build_search_system_instruction(),
             tools=[search_web, search_news, extract_page],
+            generation_config={"max_output_tokens": 2048},
         )
         chat = model.start_chat(history=[], enable_automatic_function_calling=True)
         response = await asyncio.to_thread(chat.send_message, prompt)
@@ -294,7 +295,10 @@ async def ask_gemini_search(prompt: str) -> str:
         text = ""
     if not text:
         text = "（応答が空でした。もう一度お試しください）"
-    if sources:
+    # Append the collected real sources only when the answer itself
+    # contains no URL; if the model already cited its sources inline,
+    # a second, possibly different list would just confuse readers.
+    if sources and "http" not in text:
         text += "\n\n出典:\n" + "\n".join(
             f"- {title} {url}" for title, url in sources[:5]
         )
