@@ -9,28 +9,31 @@ Discord + Gemini AI chat bot.
 - Mentioning the bot inside any thread (re)activates that thread as a
   conversation thread.
 - Search: messages starting with 「調べて」 (or the /search command) let
-  the model use Tavily tools (web search, plus full-page extraction
-  when a snippet is not enough) and answer with cited source URLs.
-  If search is unavailable, the bot falls back to a normal answer.
+  the model use Tavily tools (web search, a dedicated news search,
+  plus full-page extraction when a snippet is not enough) and answer
+  with cited source URLs. If search is unavailable, the bot falls back
+  to a normal answer (except on rate limits, where it says so).
+- Gemini is called through the google-genai SDK's async client
+  (client.aio) and Tavily through AsyncTavilyClient, so no call ever
+  blocks the Discord event loop.
 - keep_alive: a small Flask server runs in a background thread so
   Render (and uptime pingers) have an HTTP endpoint to hit.
 """
 
-import asyncio
 import contextvars
 import datetime
-import json
 import os
 import re
 import threading
-import urllib.request
 import zoneinfo
 
 import discord
-import google.generativeai as genai
 from discord import app_commands
 from discord.ext import commands
 from flask import Flask
+from google import genai
+from google.genai import types
+from tavily import AsyncTavilyClient
 
 # ---------------------------------------------------------------------------
 # keep_alive (Render free-tier sleep workaround)
@@ -59,7 +62,7 @@ def keep_alive():
 
 
 # ---------------------------------------------------------------------------
-# Gemini setup
+# Gemini / Tavily setup (async clients: the event loop is never blocked)
 # ---------------------------------------------------------------------------
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
@@ -67,66 +70,111 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 
 # Guild used for instant slash-command sync during testing.
-# Global sync also runs, so other guilds get /thread as it propagates.
+# Global sync also runs, so other guilds get the commands as they propagate.
 TEST_GUILD_ID = 1570294742137176134
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+tavily_client = AsyncTavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
 
-# Per-thread chat sessions: thread_id -> Gemini chat session
+RATE_LIMIT_MESSAGE = (
+    "⚠️ いま少し混み合っています（Geminiの無料枠の上限に達しました）。"
+    "1分ほど待ってからもう一度試してください。"
+)
+GENERIC_ERROR_MESSAGE = "エラーが発生しました。しばらくしてからもう一度お試しください。"
+
+
+def is_rate_limit(exc: Exception) -> bool:
+    return getattr(exc, "code", None) == 429
+
+
+def user_error_message(exc: Exception) -> str:
+    return RATE_LIMIT_MESSAGE if is_rate_limit(exc) else GENERIC_ERROR_MESSAGE
+
+
+_WEEKDAYS_JA = ["月", "火", "水", "木", "金", "土", "日"]
+
+
+def now_str_jst() -> str:
+    now = datetime.datetime.now(zoneinfo.ZoneInfo("Asia/Tokyo"))
+    return f"{now:%Y年%m月%d日}（{_WEEKDAYS_JA[now.weekday()]}）{now:%H:%M}"
+
+
+def build_chat_system_instruction() -> str:
+    """Light system instruction for normal (non-search) answers."""
+    return (
+        f"現在の日時は {now_str_jst()}（日本時間）です。"
+        "日付や時刻が関係する話題では、この日時を前提に答えてください。"
+        "回答は日本語で、簡潔に答えてください。"
+    )
+
+
+# Per-thread chat sessions: thread_id -> AsyncChat
 chat_sessions: dict[int, object] = {}
 
 
 def get_chat_session(thread_id: int):
     if thread_id not in chat_sessions:
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        chat_sessions[thread_id] = model.start_chat(history=[])
+        chat_sessions[thread_id] = gemini_client.aio.chats.create(
+            model=GEMINI_MODEL,
+            config=types.GenerateContentConfig(
+                system_instruction=build_chat_system_instruction()
+            ),
+            history=[],
+        )
     return chat_sessions[thread_id]
+
+
+def _clean_text(response) -> str:
+    try:
+        text = (response.text or "").strip()
+    except Exception:  # noqa: BLE001 - e.g. blocked response without text
+        text = ""
+    return text if text else "（応答が空でした。もう一度お試しください）"
 
 
 async def ask_gemini(thread_id: int, prompt: str) -> str:
     """Ask with the per-thread conversation history."""
     chat = get_chat_session(thread_id)
-    # google-generativeai is synchronous; run it off the event loop.
-    response = await asyncio.to_thread(chat.send_message, prompt)
-    text = (response.text or "").strip()
-    return text if text else "（応答が空でした。もう一度お試しください）"
+    response = await chat.send_message(prompt)
+    return _clean_text(response)
 
 
 async def ask_gemini_once(prompt: str) -> str:
     """Ask a one-shot question with no conversation history."""
-    model = genai.GenerativeModel(GEMINI_MODEL)
-    response = await asyncio.to_thread(model.generate_content, prompt)
-    text = (response.text or "").strip()
-    return text if text else "（応答が空でした。もう一度お試しください）"
+    response = await gemini_client.aio.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=build_chat_system_instruction()
+        ),
+    )
+    return _clean_text(response)
 
 
 # --- Search (Tavily tools driven by Gemini automatic function calling) ---
 SEARCH_TRIGGER_RE = re.compile(r"^(調べて|検索して)[\s:：、]*")
 
-_WEEKDAYS_JA = ["月", "火", "水", "木", "金", "土", "日"]
-
 
 def build_search_system_instruction() -> str:
     """System instruction for search answers, with the current JST
     date/time baked in so the model builds recency-aware queries."""
-    now = datetime.datetime.now(zoneinfo.ZoneInfo("Asia/Tokyo"))
-    now_str = f"{now:%Y年%m月%d日}（{_WEEKDAYS_JA[now.weekday()]}）{now:%H:%M}"
     return (
-        f"現在の日時は {now_str}（日本時間）です。"
+        f"現在の日時は {now_str_jst()}（日本時間）です。"
         "あなたはWeb検索ツールを使って最新情報を調べるアシスタントです。"
         "回答する前に、必ず検索ツールで検索してください。"
         "「最新」「今日」「直近」などの質問では、現在日時を基準に検索し、"
         "古い情報を最新として扱わないでください。"
         "ニュースや時事の話題には search_news ツール（ニュース専用・新しい順）を、"
         "それ以外の調べものには search_web ツールを使ってください。"
-        "検索結果のスニペットだけでは情報が不十分な場合は、extract_page ツールで"
-        "該当ページの全文を読んでから答えてください。"
+        "単純な質問では検索は1回で終え、情報が足りない場合だけ追加検索や "
+        "extract_page ツール（ページ全文の取得）を使ってください。"
         "記事の公開日を確認し、古い日付の記事は最新の話題として扱わないでください。"
-        "事実に関する主張には、根拠となったページのURLを引用として必ず含めてください。"
+        "事実に関する主張には、根拠となったページへのリンクを "
+        "[タイトル](<URL>) の形式で必ず含めてください。"
         "URLはツールの結果に実際に含まれるものだけを使い、存在しないURLを創作してはいけません。"
         "回答は日本語で簡潔にまとめてください。"
     )
+
 
 # URLs actually returned by the tools during the current search request:
 # list of (title, url). Used to append a guaranteed-real source list.
@@ -147,37 +195,6 @@ def _collect_source(title: str, url: str):
     sources.append((title or url, url))
 
 
-def _tavily_post(path: str, payload: dict) -> dict:
-    if not TAVILY_API_KEY:
-        raise RuntimeError("TAVILY_API_KEY is not set")
-    request = urllib.request.Request(
-        f"https://api.tavily.com{path}",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {TAVILY_API_KEY}",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
-def _tavily_search_sync(
-    query: str, search_depth: str, topic: str, time_range: str = ""
-) -> list[dict]:
-    payload = {
-        "query": query,
-        "max_results": 5,
-        "search_depth": search_depth,
-        "topic": topic,
-    }
-    if time_range:
-        payload["time_range"] = time_range
-    data = _tavily_post("/search", payload)
-    return data.get("results", [])
-
-
 def _format_results(results: list[dict]) -> str:
     """Format Tavily results for the model, including publish dates
     when available so it can judge freshness itself."""
@@ -193,7 +210,7 @@ def _format_results(results: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
-def search_web(
+async def search_web(
     query: str,
     search_depth: str = "basic",
     topic: str = "general",
@@ -208,25 +225,34 @@ def search_web(
             unlikely to be enough).
         topic: "general" (default) or "news" (for recent news).
         time_range: Optional recency filter: "day", "week", "month"
-            or "year". For questions about today or the latest news,
-            use topic="news" with time_range="day" (or "week").
+            or "year".
 
     Returns:
-        Search results as text: title, URL and a snippet per result.
+        Search results as text: title, published date, URL and a
+        snippet per result.
     """
+    if tavily_client is None:
+        raise RuntimeError("TAVILY_API_KEY is not set")
     if search_depth not in ("basic", "advanced"):
         search_depth = "basic"
     if topic not in ("general", "news"):
         topic = "general"
-    if time_range not in ("", "day", "week", "month", "year"):
-        time_range = ""
-    results = _tavily_search_sync(query, search_depth, topic, time_range)
+    if time_range not in ("day", "week", "month", "year"):
+        time_range = None
+    data = await tavily_client.search(
+        query=query,
+        search_depth=search_depth,
+        topic=topic,
+        time_range=time_range,
+        max_results=5,
+    )
+    results = data.get("results", [])
     if not results:
         return "検索結果は見つかりませんでした。クエリを変えて再検索できます。"
     return _format_results(results)
 
 
-def search_news(query: str, days: int = 3) -> str:
+async def search_news(query: str, days: int = 3) -> str:
     """Search recent news (news sources only, newest first).
 
     Args:
@@ -238,19 +264,27 @@ def search_news(query: str, days: int = 3) -> str:
         News results as text: title, published date, URL and a
         snippet per result.
     """
+    if tavily_client is None:
+        raise RuntimeError("TAVILY_API_KEY is not set")
     try:
         days = int(days)
     except (TypeError, ValueError):
         days = 3
     days = max(1, min(days, 31))
-    time_range = "day" if days <= 1 else "week" if days <= 7 else "month"
-    results = _tavily_search_sync(query, "basic", "news", time_range)
+    data = await tavily_client.search(
+        query=query,
+        search_depth="basic",
+        topic="news",
+        days=days,
+        max_results=5,
+    )
+    results = data.get("results", [])
     if not results:
         return "該当する最新ニュースが見つかりませんでした。daysを広げて再検索できます。"
     return _format_results(results)
 
 
-def extract_page(url: str) -> str:
+async def extract_page(url: str) -> str:
     """Read the full text of one web page (for example from search_web).
 
     Use this when a search snippet is not enough to answer accurately.
@@ -261,46 +295,49 @@ def extract_page(url: str) -> str:
     Returns:
         The page content as Markdown text (truncated if very long).
     """
-    data = _tavily_post("/extract", {"urls": [url], "extract_depth": "basic"})
+    if tavily_client is None:
+        raise RuntimeError("TAVILY_API_KEY is not set")
+    data = await tavily_client.extract(
+        urls=[url], extract_depth="basic", format="markdown"
+    )
     results = data.get("results", [])
     if not results:
         return "ページの内容を取得できませんでした。"
     first = results[0]
     _collect_source(first.get("title") or url, url)
-    text = first.get("raw_content") or first.get("content") or ""
+    text = first.get("raw_content") or ""
     return text[:4000] if text else "ページの内容を取得できませんでした。"
 
 
 async def ask_gemini_search(prompt: str) -> str:
-    """Answer with web search: the model drives the Tavily tools itself,
-    then writes an answer citing the URLs it actually used."""
-    if not TAVILY_API_KEY:
+    """Answer with web search: the model drives the Tavily tools itself
+    (automatic function calling), then writes an answer citing sources."""
+    if tavily_client is None:
         raise RuntimeError("TAVILY_API_KEY is not set")
     sources: list = []
     token = _current_sources.set(sources)
     try:
-        model = genai.GenerativeModel(
-            GEMINI_MODEL,
-            system_instruction=build_search_system_instruction(),
-            tools=[search_web, search_news, extract_page],
-            generation_config={"max_output_tokens": 2048},
+        # AFC runs through AsyncChat: the SDK explicitly recommends chat
+        # send_message over models.generate_content for async AFC.
+        chat = gemini_client.aio.chats.create(
+            model=GEMINI_MODEL,
+            config=types.GenerateContentConfig(
+                system_instruction=build_search_system_instruction(),
+                tools=[search_web, search_news, extract_page],
+                max_output_tokens=2048,
+            ),
+            history=[],
         )
-        chat = model.start_chat(history=[], enable_automatic_function_calling=True)
-        response = await asyncio.to_thread(chat.send_message, prompt)
+        response = await chat.send_message(prompt)
     finally:
         _current_sources.reset(token)
-    try:
-        text = (response.text or "").strip()
-    except Exception:  # noqa: BLE001
-        text = ""
-    if not text:
-        text = "（応答が空でした。もう一度お試しください）"
+    text = _clean_text(response)
     # Append the collected real sources only when the answer itself
     # contains no URL; if the model already cited its sources inline,
     # a second, possibly different list would just confuse readers.
     if sources and "http" not in text:
         text += "\n\n出典:\n" + "\n".join(
-            f"- {title} {url}" for title, url in sources[:5]
+            f"- [{title}](<{url}>)" for title, url in sources[:5]
         )
     return text
 
@@ -309,8 +346,9 @@ async def answer_with_optional_search(prompt: str, normal_ask):
     """Route 「調べて…」 prompts to search; fall back to a normal answer.
 
     normal_ask is an async callable taking the prompt, used both for
-    non-search prompts and as the fallback when search fails (for
-    example when the search model's daily quota is exhausted).
+    non-search prompts and as the fallback when search fails. A Gemini
+    rate limit (429) is re-raised instead of falling back, because the
+    fallback call would hit the same limit.
     """
     match = SEARCH_TRIGGER_RE.match(prompt)
     if not match:
@@ -319,6 +357,8 @@ async def answer_with_optional_search(prompt: str, normal_ask):
     try:
         return await ask_gemini_search(query)
     except Exception as exc:  # noqa: BLE001
+        if is_rate_limit(exc):
+            raise
         print(f"Search failed, falling back: {exc}")
         base = await normal_ask(prompt)
         return "（検索できませんでした。通常の回答です）\n" + base
@@ -405,14 +445,14 @@ async def thread_command(interaction: discord.Interaction, question: str):
             reply = await ask_gemini(thread.id, question)
         except Exception as exc:  # noqa: BLE001
             print(f"Gemini error: {exc}")
-            await thread.send("エラーが発生しました。しばらくしてからもう一度お試しください。")
+            await thread.send(user_error_message(exc))
             await interaction.followup.send(f"スレッドを作りました: {thread.mention}")
             return
 
     chunks = split_message(reply)
-    await thread.send(f"{interaction.user.mention} さん\n{chunks[0]}")
+    await thread.send(f"{interaction.user.mention} さん\n{chunks[0]}", suppress_embeds=True)
     for chunk in chunks[1:]:
-        await thread.send(chunk)
+        await thread.send(chunk, suppress_embeds=True)
     await interaction.followup.send(f"スレッドを作りました: {thread.mention}")
 
 
@@ -423,20 +463,22 @@ async def search_command(interaction: discord.Interaction, question: str):
     try:
         reply = await ask_gemini_search(question)
     except Exception as exc:  # noqa: BLE001
+        if is_rate_limit(exc):
+            print(f"Search rate limited: {exc}")
+            await interaction.followup.send(RATE_LIMIT_MESSAGE)
+            return
         print(f"Search failed, falling back: {exc}")
         try:
             base = await ask_gemini_once(question)
             reply = "（検索できませんでした。通常の回答です）\n" + base
         except Exception as exc2:  # noqa: BLE001
             print(f"Gemini error: {exc2}")
-            await interaction.followup.send(
-                "エラーが発生しました。しばらくしてからもう一度お試しください。"
-            )
+            await interaction.followup.send(user_error_message(exc2))
             return
     chunks = split_message(reply)
-    await interaction.followup.send(chunks[0])
+    await interaction.followup.send(chunks[0], suppress_embeds=True)
     for chunk in chunks[1:]:
-        await interaction.channel.send(chunk)
+        await interaction.channel.send(chunk, suppress_embeds=True)
 
 
 @bot.event
@@ -466,10 +508,10 @@ async def on_message(message: discord.Message):
                 )
             except Exception as exc:  # noqa: BLE001
                 print(f"Gemini error: {exc}")
-                await message.channel.send("エラーが発生しました。しばらくしてからもう一度お試しください。")
+                await message.channel.send(user_error_message(exc))
                 return
         for chunk in split_message(reply):
-            await message.channel.send(chunk)
+            await message.channel.send(chunk, suppress_embeds=True)
         return
 
     # Everything below needs a mention
@@ -489,10 +531,10 @@ async def on_message(message: discord.Message):
                 )
             except Exception as exc:  # noqa: BLE001
                 print(f"Gemini error: {exc}")
-                await message.channel.send("エラーが発生しました。しばらくしてからもう一度お試しください。")
+                await message.channel.send(user_error_message(exc))
                 return
         for chunk in split_message(reply):
-            await message.channel.send(chunk)
+            await message.channel.send(chunk, suppress_embeds=True)
         return
 
     # --- In a normal channel: one-shot answer in the same channel ---
@@ -501,12 +543,12 @@ async def on_message(message: discord.Message):
             reply = await answer_with_optional_search(prompt, ask_gemini_once)
         except Exception as exc:  # noqa: BLE001
             print(f"Gemini error: {exc}")
-            await message.channel.send("エラーが発生しました。しばらくしてからもう一度お試しください。")
+            await message.channel.send(user_error_message(exc))
             return
     chunks = split_message(reply)
-    await message.reply(chunks[0], mention_author=False)
+    await message.reply(chunks[0], mention_author=False, suppress_embeds=True)
     for chunk in chunks[1:]:
-        await message.channel.send(chunk)
+        await message.channel.send(chunk, suppress_embeds=True)
 
 
 def main():
