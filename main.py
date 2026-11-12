@@ -602,6 +602,126 @@ def _extract_place(prompt: str) -> str | None:
     return text if 2 <= len(text) <= 12 else None
 
 
+# Major Japanese cities as a deterministic backstop: the geocoder
+# only matches full official names (「大阪市」「東京都」) and returns
+# nothing for the bare forms people actually type (「大阪」「東京」),
+# and a bad day on their side must not break the most common asks.
+_MAJOR_PLACES = {
+    "札幌": ("札幌市", "北海道", 43.0618, 141.3545),
+    "仙台": ("仙台市", "宮城県", 38.2682, 140.8694),
+    "さいたま": ("さいたま市", "埼玉県", 35.8617, 139.6455),
+    "千葉": ("千葉市", "千葉県", 35.6074, 140.1065),
+    "東京": ("東京都", "東京都", 35.6895, 139.6917),
+    "横浜": ("横浜市", "神奈川県", 35.4437, 139.6380),
+    "川崎": ("川崎市", "神奈川県", 35.5308, 139.7029),
+    "静岡": ("静岡市", "静岡県", 34.9756, 138.3828),
+    "名古屋": ("名古屋市", "愛知県", 35.1815, 137.9064),
+    "京都": ("京都市", "京都府", 35.0116, 135.7681),
+    "大阪": ("大阪市", "大阪府", 34.6937, 135.5023),
+    "堺": ("堺市", "大阪府", 34.5733, 135.4830),
+    "神戸": ("神戸市", "兵庫県", 34.6901, 135.1956),
+    "奈良": ("奈良市", "奈良県", 34.6851, 135.8048),
+    "岡山": ("岡山市", "岡山県", 34.6551, 133.9195),
+    "広島": ("広島市", "広島県", 34.3853, 132.4553),
+    "北九州": ("北九州市", "福岡県", 33.8834, 130.8752),
+    "福岡": ("福岡市", "福岡県", 33.5904, 130.4017),
+    "熊本": ("熊本市", "熊本県", 32.8063, 130.7055),
+    "鹿児島": ("鹿児島市", "鹿児島県", 31.5924, 130.5513),
+    "那覇": ("那覇市", "沖縄県", 26.2124, 127.6809),
+    "新潟": ("新潟市", "新潟県", 37.9026, 139.0232),
+    "金沢": ("金沢市", "石川県", 36.5944, 136.6256),
+    "松山": ("松山市", "愛媛県", 33.8392, 132.7657),
+    "高松": ("高松市", "香川県", 34.3401, 134.0434),
+}
+
+
+def _place_core(place: str) -> str:
+    return re.sub(r"(市|区|町|村|都|府|県)$", "", place)
+
+
+def _table_place(place: str) -> dict | None:
+    """Built-in table lookup, tolerant of suffix differences:
+    大阪市 / 大阪 / 大阪府 all find the 大阪 entry, 東京都 finds 東京."""
+    candidates = [place,
+                  re.sub(r"(市|区|町|村)$", "", place),
+                  _place_core(place)]
+    for key in candidates:
+        entry = _MAJOR_PLACES.get(key)
+        if entry is not None:
+            name, admin1, lat, lon = entry
+            return {"name": name, "admin1": admin1, "latitude": lat,
+                    "longitude": lon, "timezone": "Asia/Tokyo"}
+    return None
+
+
+def _place_variants(place: str) -> list:
+    variants = [place]
+    core = re.sub(r"(市|区|町|村)$", "", place)
+    if core != place:
+        variants.append(core)
+    if not re.search(r"(市|区|町|村|都|府|県)$", place):
+        for suffix in ("市", "都", "府", "県"):
+            variants.append(place + suffix)
+    return variants
+
+
+def _geo_accept(result: dict, variant: str, core: str) -> bool:
+    if result.get("country_code") not in (None, "JP"):
+        return False
+    name = result.get("name", "")
+    admin1 = result.get("admin1") or ""
+    if name and (variant in name or name in variant):
+        return True
+    return variant in admin1 or bool(core) and core in name \
+        or bool(core) and core in admin1
+
+
+async def _geocode_place(client: httpx.AsyncClient,
+                         place: str) -> dict | None:
+    """Resolve a Japanese place name to a geocoding result dict.
+
+    Open-Meteo's geocoder only matches full official names, so try
+    name variants （東京 → 東京都, 大阪 → 大阪市） with one retry each,
+    then fall back to the built-in table for major cities. Prints its
+    outcome either way — silent fallbacks hid a total weather outage
+    once already."""
+    table = _table_place(place)
+    if table is not None:
+        print(f"Weather geocode: {place} -> {table['name']} "
+              f"(built-in table)")
+        return table
+    core = _place_core(place)
+    tried = []
+    try:
+        for variant in _place_variants(place):
+            for _attempt in range(2):
+                geo = await client.get(
+                    "https://geocoding-api.open-meteo.com/v1/search",
+                    params={"name": variant, "count": 5,
+                            "language": "ja", "format": "json"})
+                geo.raise_for_status()
+                results = geo.json().get("results") or []
+                tried.append(f"{variant}:{len(results)}")
+                acceptable = [r for r in results
+                              if _geo_accept(r, variant, core)]
+                if acceptable:
+                    # Bare names can match a tiny town over the big
+                    # city （横浜町 vs 横浜市）; the populated one is
+                    # what people mean.
+                    best = max(acceptable,
+                               key=lambda r: r.get("population") or 0)
+                    print(f"Weather geocode: {place} -> "
+                          f"{best.get('name')} "
+                          f"({best.get('admin1')}) via {variant}")
+                    return best
+                if results:
+                    break  # answered, nothing acceptable; next variant
+    except Exception as exc:  # noqa: BLE001
+        print(f"Weather geocode error: {exc} (place={place})")
+    print(f"Weather geocode failed: place={place} tried={tried}")
+    return None
+
+
 async def fetch_weather(prompt: str) -> str | None:
     """Authoritative daily forecast block for a local-weather
     question, or None (caller falls back to web search)."""
@@ -609,24 +729,17 @@ async def fetch_weather(prompt: str) -> str | None:
         return None  # typhoons / earthquakes are news, not forecasts
     place = _extract_place(prompt)
     if place is None:
+        print(f"Weather: no place extracted from {prompt!r}")
         return None
     offset = _weather_day_offset(prompt)
     try:
         async with httpx.AsyncClient(timeout=10,
                                      headers=_HTTP_HEADERS) as client:
-            geo = await client.get(
-                "https://geocoding-api.open-meteo.com/v1/search",
-                params={"name": place, "count": 1, "language": "ja",
-                        "format": "json"})
-            geo.raise_for_status()
-            results = geo.json().get("results") or []
-            if not results:
+            top = await _geocode_place(client, place)
+            if top is None:
                 return None
-            top = results[0]
             name = top.get("name", "")
             admin1 = top.get("admin1") or ""
-            if not (place in name or name in place or place in admin1):
-                return None  # geocoder matched something unrelated
             fc = await client.get(
                 "https://api.open-meteo.com/v1/forecast",
                 params={
