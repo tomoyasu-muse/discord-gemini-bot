@@ -17,11 +17,12 @@ Discord + Gemini AI chat bot.
   searches Tavily once, then asks Gemini once with the results.
   If search is unavailable, the bot falls back to a normal answer
   (except on rate limits, where it says so).
-- Diet support (diet.py): per-user meal / weight logging. Writing
-  the calories yourself (「納豆ご飯 300kcal」) records them as-is;
-  otherwise Gemini estimates from the meal text. Records persist as
-  bot messages in a per-guild 「ダイエット記録」 channel, with
-  /today, /week, /diet-goal and morning/evening reminders.
+- Diet support (diet.py): per-user meal / weight logging through
+  slash commands only (/gohan, /weight, /diet-goal, /today, /week) —
+  mentions stay purely for questions. Writing the calories yourself
+  records them as-is; otherwise Gemini estimates from the meal text.
+  Records persist as bot messages in a per-guild 「ダイエット記録」
+  channel, with morning/evening reminders.
 - Gemini is called through the google-genai SDK's async client
   (client.aio) and Tavily through AsyncTavilyClient, so no call ever
   blocks the Discord event loop.
@@ -840,11 +841,6 @@ async def on_message(message: discord.Message):
     if in_thread and message.channel.id in active_threads:
         if not prompt:
             return
-        diet_reply = await diet.try_handle(message, prompt)
-        if diet_reply is not None:
-            for chunk in split_message(diet_reply):
-                await message.channel.send(chunk, suppress_embeds=True)
-            return
         async with message.channel.typing():
             try:
                 reply = await answer_with_optional_search(
@@ -860,15 +856,6 @@ async def on_message(message: discord.Message):
 
     # Everything below needs a mention
     if not mentioned:
-        return
-
-    # --- Diet actions (meal / weight logging) come before chat ---
-    diet_reply = await diet.try_handle(message, prompt)
-    if diet_reply is not None:
-        chunks = split_message(diet_reply)
-        await message.reply(chunks[0], mention_author=False, suppress_embeds=True)
-        for chunk in chunks[1:]:
-            await message.channel.send(chunk, suppress_embeds=True)
         return
 
     if not prompt:

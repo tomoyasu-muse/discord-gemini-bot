@@ -2,9 +2,10 @@
 Diet support for the bot: per-user meal / weight logging, daily
 calorie goals, daily & weekly summaries, and reminders.
 
-Logging a meal is deliberately low-effort: write the food and its
-calories — 「納豆ご飯 300kcal」 — in a mention or the /gohan
-command, and the numbers are recorded as-is. The parser accepts
+Logging a meal is deliberately low-effort: with the /gohan
+command, write the food and its calories — 「納豆ご飯 300kcal」 —
+and the numbers are recorded as-is. (Mentions are for questions,
+so diet actions live only in slash commands.) The parser accepts
 several items at once (「マグロ200g 230kcal パックご飯180kcal」),
 a combined total in parentheses (「ご飯、納豆、オクラ（400kcal）」),
 and half-/full-width spacing. Meals are totalled per calendar day
@@ -375,7 +376,7 @@ def week_summary(state: GuildDiet, user_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Message routing (called from main.on_message before the chat routes)
+# Manual meal input parsing (used by the /gohan command)
 # ---------------------------------------------------------------------------
 # Manual meal input is parsed, not just regex-matched, because the
 # writing varies: several items with their own calories
@@ -434,9 +435,6 @@ def parse_meal_input(text: str) -> dict | None:
             "items": items}
 
 
-WEIGHT_RE = re.compile(r"体重\s*(?:は|が)?\s*(\d{2,3}(?:\.\d+)?)\s*(?:kg|キロ)?")
-MEAL_PREFIX_RE = re.compile(r"^(食事|食べた|食べました|朝食|昼食|夕食|夜食|間食|朝ごはん|昼ごはん|夜ごはん|晩ごはん)")
-
 RATE_LIMIT_MESSAGE = (
     "⚠️ いま少し混み合っています（Geminiの無料枠の上限に達しました）。"
     "1分ほど待ってからもう一度試してください。"
@@ -445,20 +443,6 @@ SETUP_HINT = (
     "ダイエット記録はまだセットアップされていません。"
     "先に /diet-setup を実行してください（記録専用チャンネルを作ります）。"
 )
-
-
-def detect_intent(prompt: str) -> str | None:
-    """'manual' | 'weight' | 'meal' | None — decided locally, no API cost."""
-    # Messages starting with a meal prefix go to the meal route,
-    # which strips the prefix and then tries the manual parser on
-    # the rest (「食べた：納豆ご飯 300kcal」).
-    if MEAL_PREFIX_RE.match(prompt):
-        return "meal"
-    if parse_meal_input(prompt):
-        return "manual"
-    if WEIGHT_RE.search(prompt):
-        return "weight"
-    return None
 
 
 async def _record_manual(guild, state, user_id: int, parsed: dict) -> str:
@@ -474,78 +458,6 @@ async def _record_manual(guild, state, user_id: int, parsed: dict) -> str:
         lines.append(f"合計 {parsed['total']} kcal")
     lines.append(_today_line(state, user_id))
     return "\n".join(lines)
-
-
-async def try_handle(message: discord.Message, prompt: str) -> str | None:
-    """Return a reply string if the message is a diet action, else None."""
-    guild = message.guild
-    if guild is None or _client is None:
-        return None
-    intent = detect_intent(prompt)
-    if intent is None:
-        return None
-
-    state = await _ensure_loaded(guild)
-    if state.channel_id is None:
-        return SETUP_HINT
-    user_id = message.author.id
-
-    try:
-        if intent == "manual":
-            return await _record_manual(
-                guild, state, user_id, parse_meal_input(prompt))
-
-        if intent == "weight":
-            kg = float(WEIGHT_RE.search(prompt).group(1))
-            if not (20.0 <= kg <= 300.0):
-                return "体重の数値が範囲外のようです。もう一度確認してください。"
-            prev = state.latest_weight(user_id)
-            await _append_record(guild, state, "weight",
-                                 {"kg": f"{kg:.1f}"}, user_id=user_id)
-            line = f"⚖️ 体重を記録しました： {kg:.1f} kg"
-            if prev:
-                diff = kg - _f(prev["fields"], "kg")
-                line += f"（前回 {_f(prev['fields'], 'kg'):.1f} kg から {diff:+.1f} kg）"
-            goal = state.goal(user_id)
-            if goal:
-                remain = kg - _f(goal["fields"], "target_kg")
-                line += f"\n目標 {_f(goal['fields'], 'target_kg'):.1f} kg まで あと {remain:.1f} kg"
-            return line
-
-        # meal: calories may still be written out after the prefix
-        # (「食べた：納豆ご飯 300kcal」) — record those as-is too.
-        desc = MEAL_PREFIX_RE.sub("", prompt).strip(" ：:、") or prompt
-        parsed = parse_meal_input(desc)
-        if parsed:
-            return await _record_manual(guild, state, user_id, parsed)
-        est = await estimate_meal_text(desc)
-        if est is None:
-            return ("食事の内容を読み取れませんでした。"
-                    "カロリーが分かれば「納豆ご飯 300kcal」のように書くと"
-                    "そのまま記録できます。")
-        totals = _totals(est["items"])
-        name = est["meal_name"] or desc
-        await _append_record(
-            guild, state, "meal",
-            {"kcal": f"{totals['kcal']:.0f}", "p": f"{totals['p']:.1f}",
-             "f": f"{totals['f']:.1f}", "c": f"{totals['c']:.1f}"},
-            name, user_id=user_id,
-        )
-        lines = [f"🍽️ 記録しました： {name}"]
-        for item in est["items"]:
-            lines.append(
-                f"- {item['name']}： {item['kcal']:.0f} kcal"
-                f"（P {item['p']:.0f} / F {item['f']:.0f} / C {item['c']:.0f}）"
-            )
-        lines.append(f"推定合計: {_fmt_pfc(totals)}")
-        lines.append(_today_line(state, user_id))
-        lines.append("※カロリーはAIの推定です")
-        return "\n".join(lines)
-    except Exception as exc:  # noqa: BLE001
-        print(f"Diet handling failed: {exc}")
-        if getattr(exc, "code", None) == 429:
-            return RATE_LIMIT_MESSAGE
-        return "記録中にエラーが発生しました。しばらくしてからもう一度お試しください。"
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +483,7 @@ def register(bot: commands.Bot):
             await interaction.followup.send(
                 f"セットアップ済みです。記録チャンネル: {channel.mention if channel else LOG_CHANNEL_NAME}\n"
                 "使い方は /diet-goal で目標設定、/gohan で食事記録、"
-                "「体重 68.4」でも記録できます。"
+                "/weight で体重記録ができます。"
             )
             return
         overwrites = {
@@ -599,11 +511,10 @@ def register(bot: commands.Bot):
         )
         await channel.send(
             "🥗 ダイエット記録をはじめます。ここに記録が保存されます（記録はユーザーごとです）。\n"
-            "- 食事： /gohan が基本です。「マグロ200g 230kcal パックご飯180kcal」のように\n"
+            "- 食事： /gohan で記録します。「マグロ200g 230kcal パックご飯180kcal」のように\n"
             "　複数まとめて書けます。「ご飯、納豆、オクラ（400kcal）」と合計だけでもOK\n"
-            "　メンションで同じように書いても記録されます\n"
             "　カロリーが分からなければ品名だけで、AIが推定します\n"
-            "- 体重： 「体重 68.4」のように送る\n"
+            "- 体重： /weight で記録します\n"
             "- 目標： /diet-goal で目標体重と1日の目標カロリーを設定\n"
             "- 集計： /today（今日）・/week（直近7日）。集計は0時〜24時単位です\n"
             "- リマインド： 朝8時に体重、夜21時に記録もれの声かけ（/diet-remind で切替）"
@@ -803,7 +714,7 @@ async def _reminder_loop():
                              if latest else "")
                     await channel.send(
                         f"<@{user_id}> おはようございます☀️ 体重を測ったら"
-                        "「体重 68.4」のように教えてください。" + extra)
+                        "/weight で記録してください。" + extra)
                 elif kind == "evening":
                     await channel.send(
                         f"<@{user_id}> 今日の記録もれはないですか？\n"
