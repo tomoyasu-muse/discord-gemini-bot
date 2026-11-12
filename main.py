@@ -174,6 +174,14 @@ REALTIME_PATTERN = re.compile(
     r"ググって|調べて|検索して)"
 )
 NEWS_PATTERN = re.compile(r"(ニュース|速報|事件|事故|トレンド)")
+FINANCE_PATTERN = re.compile(
+    r"(ドル円|円相場|円安|円高|為替|ビットコイン|仮想通貨|"
+    r"株価|日経平均|ダウ平均|ナスダック|決算発表)"
+)
+WEATHER_PATTERN = re.compile(r"(天気|気温|降水確率|台風)")
+# Weather answers are only as good as the forecast pages behind them;
+# generic results mix in past-weather records and unrelated pages.
+WEATHER_DOMAINS = ["weather.yahoo.co.jp", "tenki.jp", "weathernews.jp"]
 
 
 def build_search_system_instruction() -> str:
@@ -206,6 +214,11 @@ def build_prefetch_system_instruction() -> str:
         "天気・為替・株価などのリアルタイムな情報は、検索結果の内容を優先して答えてください。"
         "もし検索結果に質問と関係ない情報しかない場合は、検索結果を無視して"
         "一般的な知識で普通に答えてください。"
+        "天気予報では、過去の実況データと今後の予報を混同しないでください。"
+        "天気の質問で場所が指定されていない場合は、特定の都市の予報を断定せず、"
+        "全国の概況を簡潔に伝えたうえで、詳しく知りたい場合は場所を教えてほしいと添えてください。"
+        "為替・株価では、検索結果に具体的な現在値があれば必ずその数値を答え、"
+        "なければ無いと正直に伝えてください。"
         "出典を示すときは [タイトル](<URL>) の形式で、検索結果に含まれるURLだけを使ってください。"
         "回答は日本語で簡潔にまとめてください。"
     )
@@ -250,6 +263,7 @@ async def search_web(
     search_depth: str = "basic",
     topic: str = "general",
     time_range: str = "",
+    include_domains: list | None = None,
 ) -> str:
     """Search the web for current information.
 
@@ -258,9 +272,12 @@ async def search_web(
         search_depth: "basic" (default, 1 credit) or "advanced"
             (2 credits, deeper search; use only when basic detail is
             unlikely to be enough).
-        topic: "general" (default) or "news" (for recent news).
+        topic: "general" (default), "news" (for recent news) or
+            "finance" (for market prices and financial data).
         time_range: Optional recency filter: "day", "week", "month"
             or "year".
+        include_domains: Optional list of domains to restrict the
+            search to.
 
     Returns:
         Search results as text: title, published date, URL and a
@@ -270,7 +287,7 @@ async def search_web(
         raise RuntimeError("TAVILY_API_KEY is not set")
     if search_depth not in ("basic", "advanced"):
         search_depth = "basic"
-    if topic not in ("general", "news"):
+    if topic not in ("general", "news", "finance"):
         topic = "general"
     if time_range not in ("day", "week", "month", "year"):
         time_range = None
@@ -280,6 +297,7 @@ async def search_web(
         topic=topic,
         time_range=time_range,
         max_results=5,
+        include_domains=include_domains or None,
     )
     results = data.get("results", [])
     if not results:
@@ -387,13 +405,22 @@ async def ask_gemini_prefetch(prompt: str) -> str:
     sources: list = []
     token = _current_sources.set(sources)
     try:
+        today = datetime.datetime.now(
+            zoneinfo.ZoneInfo("Asia/Tokyo")
+        ).strftime("%Y年%m月%d日")
+        query = f"{prompt}（{today} 現在）"
         if NEWS_PATTERN.search(prompt):
             results_text = await search_news(prompt, days=3)
+        elif FINANCE_PATTERN.search(prompt):
+            # Tavily's finance topic returns quote pages with actual
+            # current values, unlike general search's outlook articles.
+            results_text = await search_web(query, topic="finance")
+        elif WEATHER_PATTERN.search(prompt):
+            # Restrict to forecast sites so past-weather records and
+            # unrelated pages do not pollute the answer.
+            results_text = await search_web(query, include_domains=WEATHER_DOMAINS)
         else:
-            today = datetime.datetime.now(
-                zoneinfo.ZoneInfo("Asia/Tokyo")
-            ).strftime("%Y年%m月%d日")
-            results_text = await search_web(f"{prompt}（{today} 現在）")
+            results_text = await search_web(query)
     finally:
         _current_sources.reset(token)
     contents = (
