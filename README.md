@@ -60,7 +60,11 @@ Discord + Gemini API chat bot.
   (「納豆ご飯 300kcal」) and the numbers are logged as-is; the
   parser also accepts several items at once (「マグロ200g 230kcal
   パックご飯180kcal」) and a combined total in parentheses
-  (「ご飯、納豆、オクラ（400kcal）」). Meals are totalled per
+  (「ご飯、納豆、オクラ（400kcal）」). List-style input whose items
+  carry amounts (「マグロ 100g アジ 100g パックご飯161kcal」) is
+  itemised by those amounts — spoon measures included (大さじ・
+  小さじ) — so items with known calories are logged as-is and the
+  rest are estimated, all in one record. Meals are totalled per
   logical day (04:00–04:00 JST; entries before 04:00 count as
   the previous day) and each log reply reports the
   day's intake against that user's daily goal. Without calories,

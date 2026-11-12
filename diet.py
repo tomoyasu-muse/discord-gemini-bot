@@ -592,11 +592,79 @@ _ITEM_SEPARATORS = " 　、・,，"
 
 
 def _normalize(text: str) -> str:
-    return unicodedata.normalize("NFKC", text or "")
+    t = unicodedata.normalize("NFKC", text or "")
+    # Newlines act as item separators, like 、.
+    return t.replace("\r\n", "、").replace("\n", "、").replace("\r", "、")
 
 
 def _clean_item_name(text: str) -> str:
     return text.strip(_ITEM_SEPARATORS)
+
+
+_AMOUNT_NUMBER = r"(?:\d+(?:\.\d+)?|\d+/\d+)"
+_AMOUNT_UNITS = (r"(?:g|kg|ml|l|個|枚|本|切れ|パック|人前|食分|杯|皿|"
+                 r"粒|袋|缶|束|玉|丁|尾|匹|かけ|片)")
+# A chunk that is only an amount: 「100g」「2個」「大さじ1」「小さじ2」
+# 「少々」... Spoon measures count as amounts of the previous food.
+_AMOUNT_CHUNK_RE = re.compile(
+    r"^(?:" + _AMOUNT_NUMBER + r")\s*" + _AMOUNT_UNITS + r"$"
+    r"|^(?:大さじ|小さじ|カップ)(?:" + _AMOUNT_NUMBER + r")$"
+    r"|^(?:少々|適量|ひとつまみ)$", re.IGNORECASE)
+# A chunk that ends with an amount glued to a name: 「アジ100g」.
+_GLUED_AMOUNT_RE = re.compile(
+    r"^(?P<name>.+?)(?P<amount>" + _AMOUNT_NUMBER + _AMOUNT_UNITS +
+    r"|(?:大さじ|小さじ|カップ)" + _AMOUNT_NUMBER + r")$",
+    re.IGNORECASE)
+_SPOON_WORDS = ("大さじ", "小さじ", "カップ")
+_MODIFIER_CHUNKS = ("大盛り", "特盛", "小盛り", "並盛", "半分",
+                    "少なめ", "多め")
+
+
+def _split_items(segment: str) -> list[str]:
+    """Split a space-separated run into food items.
+
+    An item is a name plus its optional amount. An amount chunk
+    (「100g」「大さじ1」「2個」) closes the item it follows; a
+    chunk with the amount glued on (「アジ100g」) is a complete
+    item by itself; anything else continues the current name.
+    「マグロ 100g アジ 100g パックご飯」 →
+    ['マグロ100g', 'アジ100g', 'パックご飯'], while
+    「ご飯 納豆 オクラ」 (no amounts) stays one item.
+    """
+    parts = [p for p in re.split(r"\s+", (segment or "").strip()) if p]
+    items: list[str] = []
+    current = ""
+    pending_spoon = False
+    for part in parts:
+        if pending_spoon and re.fullmatch(_AMOUNT_NUMBER, part):
+            current += part
+            items.append(current)
+            current = ""
+            pending_spoon = False
+            continue
+        pending_spoon = False
+        if part in _SPOON_WORDS:
+            current += part
+            pending_spoon = True
+            continue
+        if _AMOUNT_CHUNK_RE.match(part):
+            current += part
+            items.append(current)
+            current = ""
+            continue
+        if part in _MODIFIER_CHUNKS:
+            current += part
+            continue
+        if _GLUED_AMOUNT_RE.match(part):
+            if current:
+                items.append(current)
+            items.append(part)
+            current = ""
+            continue
+        current = (current + " " + part) if current else part
+    if current:
+        items.append(current)
+    return items
 
 
 def _scan_items(t: str):
@@ -648,6 +716,15 @@ def parse_meal_input(text: str) -> dict | None:
     items, residue = _scan_items(t)
     if not items or residue:
         return None
+    # A segment that itemises into several foods (「マグロ 100g
+    # アジ 100g パックご飯」) means some foods carry no value of
+    # their own — that is mixed input, not a pure manual log.
+    for name, _kcal in items:
+        sub = []
+        for part in re.split(r"[、・,，]", name):
+            sub.extend(_split_items(part))
+        if len(sub) > 1:
+            return None
     return {"name": "、".join(name for name, _ in items),
             "total": sum(kcal for _, kcal in items),
             "items": items}
@@ -675,13 +752,15 @@ def parse_partial_input(text: str) -> dict | None:
             continue
         parts = [p.strip() for p in re.split(r"[、・,，]", segment)
                  if p.strip()]
+        # Within the last run, itemise by amounts: only the final
+        # item owns the kcal value; earlier items go to estimation.
+        last_items = _split_items(parts[-1]) if parts else [segment]
         if len(parts) > 1:
-            estimate_parts.extend(parts[:-1])
-            manual_items.append(
-                (parts[-1], int(round(float(token.group(1))))))
-        else:
-            manual_items.append(
-                (segment, int(round(float(token.group(1))))))
+            for part in parts[:-1]:
+                estimate_parts.extend(_split_items(part))
+        estimate_parts.extend(last_items[:-1])
+        manual_items.append(
+            (last_items[-1], int(round(float(token.group(1))))))
         name_start = token.end()
     tail = _FILLER_SUFFIX_RE.sub(
         "", t[name_start:].strip(_ITEM_SEPARATORS)).strip()
