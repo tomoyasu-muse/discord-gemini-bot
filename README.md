@@ -12,7 +12,7 @@ Discord + Gemini API chat bot.
 ## Environment variables
 - `DISCORD_TOKEN` — Discord bot token (Message Content Intent must be ON)
 - `GEMINI_API_KEY` — Gemini API key from Google AI Studio
-- `GEMINI_MODEL` — optional, defaults to `gemini-2.0-flash`
+- `GEMINI_MODEL` — optional, defaults to `gemini-3.5-flash-lite`
 - `PORT` — optional, defaults to `8080` (Render sets this automatically)
 
 ## Run on Render
