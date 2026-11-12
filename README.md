@@ -21,7 +21,14 @@ Discord + Gemini API chat bot.
   source list it collected. Questions that clearly need real-time data
   (weather, FX rates, stock prices, news…) are auto-detected by a
   keyword regex — no 「調べて」 needed — and use a faster pre-fetch
-  route (Python searches Tavily once, then one Gemini call). Tavily's free plan allows 1,000 credits/month and needs no credit card. If a
+  route (Python searches Tavily once, then one Gemini call). For FX
+  rates, major indices and Bitcoin, no search is used at all: the
+  number is fetched directly from Yahoo Finance's chart API (with a
+  daily ExchangeRate-API fallback for currency pairs). Stock questions
+  use a domain-restricted Tavily search (kabutan.jp,
+  finance.yahoo.co.jp, minkabu.jp) with raw page content, and when a
+  ticker code can be identified from the result URLs, the same chart
+  API provides the authoritative price. Tavily's free plan allows 1,000 credits/month and needs no credit card. If a
   search fails (or no API key is configured), the bot falls back to a
   normal answer; a Gemini rate limit (429) is reported as such instead.
 - Gemini is called via the google-genai SDK's async client

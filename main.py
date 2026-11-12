@@ -32,6 +32,7 @@ import threading
 import zoneinfo
 
 import discord
+import httpx
 from discord import app_commands
 from discord.ext import commands
 from flask import Flask
@@ -182,6 +183,136 @@ WEATHER_PATTERN = re.compile(r"(天気|気温|降水確率|台風)")
 # Weather answers are only as good as the forecast pages behind them;
 # generic results mix in past-weather records and unrelated pages.
 WEATHER_DOMAINS = ["weather.yahoo.co.jp", "tenki.jp", "weathernews.jp"]
+STOCK_DOMAINS = ["kabutan.jp", "finance.yahoo.co.jp", "minkabu.jp"]
+
+# --- Direct quote fetching (no Tavily) -------------------------------------
+# Live numbers (FX rates, indices, crypto) cannot be reliably carried by
+# search snippets, so well-known symbols are fetched as numbers straight
+# from Yahoo Finance's chart API (the same endpoint yfinance uses; no API
+# key). Stocks go through Tavily for identification, then the same API
+# provides the authoritative price (see ask_gemini_prefetch).
+_YAHOO_CHART_URL = "https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
+_HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    )
+}
+
+# (trigger regex, Yahoo ticker, label, source URL, (base, quote) for the
+# ExchangeRate-API fallback or None). Checked in order.
+DIRECT_SYMBOLS = [
+    (r"ドル円|米ドル円", "USDJPY=X", "ドル円（USD/JPY）",
+     "https://finance.yahoo.co.jp/quote/USDJPY=FX", ("USD", "JPY")),
+    (r"ユーロ円", "EURJPY=X", "ユーロ円（EUR/JPY）",
+     "https://finance.yahoo.co.jp/quote/EURJPY=FX", ("EUR", "JPY")),
+    (r"ポンド円", "GBPJPY=X", "ポンド円（GBP/JPY）",
+     "https://finance.yahoo.co.jp/quote/GBPJPY=FX", ("GBP", "JPY")),
+    (r"豪ドル円|オーストラリアドル円", "AUDJPY=X", "豪ドル円（AUD/JPY）",
+     "https://finance.yahoo.co.jp/quote/AUDJPY=FX", ("AUD", "JPY")),
+    (r"NZドル円|ニュージーランドドル円", "NZDJPY=X", "NZドル円（NZD/JPY）",
+     "https://finance.yahoo.co.jp/quote/NZDJPY=FX", ("NZD", "JPY")),
+    (r"カナダドル円", "CADJPY=X", "カナダドル円（CAD/JPY）",
+     "https://finance.yahoo.co.jp/quote/CADJPY=FX", ("CAD", "JPY")),
+    (r"スイスフラン円", "CHFJPY=X", "スイスフラン円（CHF/JPY）",
+     "https://finance.yahoo.co.jp/quote/CHFJPY=FX", ("CHF", "JPY")),
+    (r"人民元円|中国元円", "CNYJPY=X", "人民元円（CNY/JPY）",
+     "https://finance.yahoo.co.jp/quote/CNYJPY=FX", ("CNY", "JPY")),
+    (r"ビットコイン|BTC", "BTC-JPY", "ビットコイン（BTC/JPY）",
+     "https://finance.yahoo.com/quote/BTC-JPY", None),
+    (r"日経平均|日経225", "^N225", "日経平均株価",
+     "https://finance.yahoo.co.jp/quote/998407.O", None),
+    (r"ダウ平均|NYダウ|ダウ(?!ン)", "^DJI", "ダウ平均（NYダウ）",
+     "https://finance.yahoo.com/quote/%5EDJI", None),
+    (r"ナスダック|NASDAQ", "^IXIC", "ナスダック総合指数",
+     "https://finance.yahoo.com/quote/%5EIXIC", None),
+    (r"S&P|Ｓ＆Ｐ|SP500", "^GSPC", "S&P 500",
+     "https://finance.yahoo.com/quote/%5EGSPC", None),
+]
+DIRECT_SYMBOL_RES = [(re.compile(pat), t, lbl, url, pair)
+                     for pat, t, lbl, url, pair in DIRECT_SYMBOLS]
+
+
+def _match_direct_symbol(prompt: str):
+    for pattern, ticker, label, url, pair in DIRECT_SYMBOL_RES:
+        if pattern.search(prompt):
+            return ticker, label, url, pair
+    return None
+
+
+def _fmt_num(value: float) -> str:
+    text = f"{value:,.4f}".rstrip("0").rstrip(".")
+    return text if text else "0"
+
+
+async def fetch_quote(ticker: str) -> dict | None:
+    """Fetch a quote from Yahoo Finance's chart API. Returns a dict with
+    price/change/pct/currency/time, or None on any failure."""
+    try:
+        async with httpx.AsyncClient(timeout=10, headers=_HTTP_HEADERS) as client:
+            resp = await client.get(
+                _YAHOO_CHART_URL.format(ticker=ticker),
+                params={"interval": "1m", "range": "1d"},
+            )
+            resp.raise_for_status()
+            meta = resp.json()["chart"]["result"][0]["meta"]
+        price = float(meta["regularMarketPrice"])
+        prev = meta.get("chartPreviousClose")
+        change = price - float(prev) if prev else meta.get("fulldayChange")
+        pct = meta.get("regularMarketChangePercent")
+        if pct is None:
+            pct = meta.get("fulldayChangePercent")
+        when = datetime.datetime.fromtimestamp(
+            int(meta["regularMarketTime"]), zoneinfo.ZoneInfo("Asia/Tokyo")
+        )
+        return {
+            "price": price,
+            "change": change,
+            "pct": pct,
+            "currency": meta.get("currency", ""),
+            "time": when.strftime("%Y年%m月%d日 %H:%M"),
+        }
+    except Exception as exc:  # noqa: BLE001
+        print(f"Quote fetch failed for {ticker}: {exc}")
+        return None
+
+
+async def fetch_fx_rate_fallback(base: str, quote_ccy: str) -> dict | None:
+    """Daily reference rate from the free ExchangeRate-API open endpoint
+    (no key). Used only when Yahoo Finance is unreachable."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"https://open.er-api.com/v6/latest/{base}")
+            resp.raise_for_status()
+            data = resp.json()
+        rate = float(data["rates"][quote_ccy])
+        return {"price": rate, "currency": quote_ccy, "daily": True,
+                "time": data.get("time_last_update_utc", "")}
+    except Exception as exc:  # noqa: BLE001
+        print(f"FX fallback failed for {base}/{quote_ccy}: {exc}")
+        return None
+
+
+def _quote_block(label: str, source_url: str, quote: dict, daily: bool = False) -> str:
+    provider = "ExchangeRate-API" if daily else "Yahoo Finance"
+    _collect_source(f"{label} - {provider}", source_url)
+    if daily:
+        return (
+            f"【{label} の数値データ（ExchangeRate-API の日次レート、"
+            f"最終更新: {quote['time']}）】\n"
+            f"レート: {_fmt_num(quote['price'])} {quote['currency']}\n"
+            f"出典: {source_url}"
+        )
+    change = quote.get("change")
+    pct = quote.get("pct")
+    change_text = ""
+    if change is not None and pct is not None:
+        change_text = f"\n前日比: {change:+,.2f}（{pct:+.2f}%）"
+    return (
+        f"【{label} の数値データ（Yahoo Finance、{quote['time']} 時点）】\n"
+        f"現在値: {_fmt_num(quote['price'])} {quote['currency']}{change_text}\n"
+        f"出典: {source_url}"
+    )
 
 
 def build_search_system_instruction() -> str:
@@ -213,6 +344,7 @@ def build_prefetch_system_instruction() -> str:
         "ユーザーの質問と、それに対するWeb検索結果が渡されます。"
         "あなたには検索結果が渡されているので、「リアルタイムデータにアクセスできない」"
         "とは言わず、検索結果に基づいて答えてください。"
+        "「数値データ」として現在値が渡された場合は、その数値を正確にそのまま使って答えてください。"
         "天気・為替・株価などのリアルタイムな情報は、検索結果の内容を優先して答えてください。"
         "もし検索結果に質問と関係ない情報しかない場合は、検索結果を無視して"
         "一般的な知識で普通に答えてください。"
@@ -245,14 +377,20 @@ def _collect_source(title: str, url: str):
     sources.append((title or url, url))
 
 
-def _format_results(results: list[dict]) -> str:
+def _format_results(results: list[dict], raw_chars: int = 0) -> str:
     """Format Tavily results for the model, including publish dates
-    when available so it can judge freshness itself."""
+    when available so it can judge freshness itself. With raw_chars,
+    the page's raw content (head) replaces the short snippet — needed
+    for quote pages whose price falls outside the snippet window."""
     parts = []
     for index, result in enumerate(results, start=1):
         title = result.get("title") or "(no title)"
         url = result.get("url") or ""
-        content = (result.get("content") or "")[:600]
+        raw = result.get("raw_content") or ""
+        if raw_chars and raw:
+            content = raw[:raw_chars]
+        else:
+            content = (result.get("content") or "")[:600]
         _collect_source(title, url)
         published = result.get("published_date")
         date_line = f"公開日: {published}\n" if published else ""
@@ -266,6 +404,7 @@ async def search_web(
     topic: str = "general",
     time_range: str = "",
     include_domains: list | None = None,
+    include_raw_content: bool = False,
 ) -> str:
     """Search the web for current information.
 
@@ -280,10 +419,12 @@ async def search_web(
             or "year".
         include_domains: Optional list of domains to restrict the
             search to.
+        include_raw_content: Also fetch each page's full text; the
+            head of it is included in the results.
 
     Returns:
         Search results as text: title, published date, URL and a
-        snippet per result.
+        snippet (or raw content head) per result.
     """
     if tavily_client is None:
         raise RuntimeError("TAVILY_API_KEY is not set")
@@ -298,13 +439,14 @@ async def search_web(
         search_depth=search_depth,
         topic=topic,
         time_range=time_range,
-        max_results=5,
+        max_results=3 if include_raw_content else 5,
         include_domains=include_domains or None,
+        include_raw_content=include_raw_content or None,
     )
     results = data.get("results", [])
     if not results:
         return "検索結果は見つかりませんでした。クエリを変えて再検索できます。"
-    return _format_results(results)
+    return _format_results(results, raw_chars=2500 if include_raw_content else 0)
 
 
 async def search_news(query: str, days: int = 3) -> str:
@@ -397,6 +539,57 @@ async def ask_gemini_search(prompt: str) -> str:
     return text
 
 
+_TICKER_RES = [
+    (re.compile(r"kabutan\.jp/stock/\?code=(\d{4})"), "{}.T"),
+    (re.compile(r"finance\.yahoo\.co\.jp/quote/(\d{4})\.T"), "{}.T"),
+    (re.compile(r"minkabu\.jp/stock/(\d{4})"), "{}.T"),
+    (re.compile(r"kabutan\.jp/stock_us/\?code=([A-Z]{1,6})"), "{}"),
+]
+
+
+def _extract_ticker(sources: list) -> str | None:
+    """Identify a Yahoo Finance ticker from search-result URLs
+    (kabutan / Yahoo Finance JP / minkabu quote pages)."""
+    for _title, url in sources:
+        for pattern, fmt in _TICKER_RES:
+            match = pattern.search(url)
+            if match:
+                return fmt.format(match.group(1))
+    return None
+
+
+async def _prefetch_finance(prompt: str, sources: list) -> str:
+    """Finance route for stocks and other market questions.
+
+    Search snippets structurally lose live prices (portal pages are
+    JS-rendered and noisy), so: domain-restricted Tavily search with
+    raw page content and NO date in the query (a date biases results
+    toward dated outlook articles), then, when a ticker can be
+    identified from the result URLs, an authoritative Yahoo Finance
+    quote replaces the search text.
+    """
+    q = prompt.replace("？", "").replace("?", "").strip()
+    q = re.sub(r"(は|を)?(教えて|ください)$", "", q).strip()
+    if "現在値" not in q:
+        q += " 現在値"
+    text = await search_web(
+        q, include_domains=STOCK_DOMAINS, include_raw_content=True
+    )
+    if text.startswith("検索結果は見つかりませんでした"):
+        return await search_web(prompt)
+    ticker = _extract_ticker(sources)
+    if ticker:
+        quote = await fetch_quote(ticker)
+        if quote is not None:
+            if ticker.endswith(".T"):
+                url = f"https://finance.yahoo.co.jp/quote/{ticker}"
+            else:
+                url = f"https://finance.yahoo.com/quote/{ticker}"
+            block = _quote_block(f"{ticker} の株価", url, quote)
+            return block + "\n\n（参考）検索結果:\n" + text[:800]
+    return text
+
+
 async def ask_gemini_prefetch(prompt: str) -> str:
     """Pre-fetch route for real-time questions: Python searches Tavily
     once, then asks Gemini once with the results attached. No function
@@ -411,17 +604,27 @@ async def ask_gemini_prefetch(prompt: str) -> str:
             zoneinfo.ZoneInfo("Asia/Tokyo")
         ).strftime("%Y年%m月%d日")
         query = f"{prompt}（{today} 現在）"
+        direct = _match_direct_symbol(prompt)
         if NEWS_PATTERN.search(prompt):
             results_text = await search_news(prompt, days=3)
+        elif direct is not None:
+            # FX / indices / crypto: fetch the number directly, no
+            # Tavily at all (search cannot carry live values).
+            ticker, label, source_url, pair = direct
+            quote = await fetch_quote(ticker)
+            if quote is not None:
+                results_text = _quote_block(label, source_url, quote)
+            elif pair is not None:
+                daily = await fetch_fx_rate_fallback(*pair)
+                if daily is not None:
+                    er_url = f"https://open.er-api.com/v6/latest/{pair[0]}"
+                    results_text = _quote_block(label, er_url, daily, daily=True)
+                else:
+                    results_text = await search_web(prompt)
+            else:
+                results_text = await search_web(prompt)
         elif FINANCE_PATTERN.search(prompt):
-            # Tavily's finance topic is tuned for financial queries and
-            # can return zero results for natural-language questions
-            # (observed live: 「今のドル円は？」 returned nothing and the
-            # model answered as if it had no data). Retry with general
-            # search before giving up.
-            results_text = await search_web(prompt, topic="finance")
-            if results_text.startswith("検索結果は見つかりませんでした"):
-                results_text = await search_web(query)
+            results_text = await _prefetch_finance(prompt, sources)
         elif WEATHER_PATTERN.search(prompt):
             # Restrict to forecast sites so past-weather records and
             # unrelated pages do not pollute the answer.
