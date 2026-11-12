@@ -36,6 +36,7 @@ import contextvars
 import datetime
 import os
 import re
+import sys
 import threading
 import zoneinfo
 
@@ -49,6 +50,12 @@ from google.genai import types
 from tavily import AsyncTavilyClient
 
 import diet
+
+# stdout is a pipe on the host, so print() would be block-buffered
+# and diagnostic lines could sit in the buffer for hours (they did —
+# a full day of weather debugging stayed invisible in the logs).
+# Line-buffer stdout so prints reach the host's log stream.
+sys.stdout.reconfigure(line_buffering=True)
 
 # ---------------------------------------------------------------------------
 # keep_alive (Render free-tier sleep workaround)
@@ -634,6 +641,52 @@ _MAJOR_PLACES = {
     "高松": ("高松市", "香川県", 34.3401, 134.0434),
 }
 
+# JMA （気象庁） forecast region codes. JMA is the primary weather
+# source for known places: official data with Japanese weather text,
+# on a different host than Open-Meteo, so one provider's outage
+# cannot silence the weather route.
+_JMA_CODES = {
+    "札幌": "016000", "仙台": "040000", "さいたま": "110000",
+    "千葉": "120000", "東京": "130000", "横浜": "140000",
+    "川崎": "140000", "静岡": "220000", "名古屋": "230000",
+    "京都": "260000", "大阪": "270000", "堺": "270000",
+    "神戸": "280000", "奈良": "290000", "岡山": "330000",
+    "広島": "340000", "北九州": "400000", "福岡": "400000",
+    "熊本": "430000", "鹿児島": "460100", "那覇": "471000",
+    "新潟": "150000", "金沢": "170000", "松山": "380000",
+    "高松": "370000",
+}
+
+# Sub-area hints inside a JMA forecast region (for most table
+# cities the core-name match or the first area is already right;
+# these are the exceptions).
+_JMA_AREA_HINT = {
+    "札幌": "石狩", "仙台": "東部", "さいたま": "南部",
+    "横浜": "東部", "川崎": "東部", "静岡": "中部",
+    "北九州": "北九州",
+}
+
+# Prefecture -> JMA region code, for the fallback path where the
+# Open-Meteo geocoder resolved a place outside the table.
+_PREFECTURE_JMA_CODES = {
+    "北海道": "016000", "青森県": "020000", "岩手県": "030000",
+    "宮城県": "040000", "秋田県": "050000", "山形県": "060000",
+    "福島県": "070000", "茨城県": "080000", "栃木県": "090000",
+    "群馬県": "100000", "埼玉県": "110000", "千葉県": "120000",
+    "東京都": "130000", "神奈川県": "140000", "新潟県": "150000",
+    "富山県": "160000", "石川県": "170000", "福井県": "180000",
+    "山梨県": "190000", "長野県": "200000", "岐阜県": "210000",
+    "静岡県": "220000", "愛知県": "230000", "三重県": "240000",
+    "滋賀県": "250000", "京都府": "260000", "大阪府": "270000",
+    "兵庫県": "280000", "奈良県": "290000", "和歌山県": "300000",
+    "鳥取県": "310000", "島根県": "320000", "岡山県": "330000",
+    "広島県": "340000", "山口県": "350000", "徳島県": "360000",
+    "香川県": "370000", "愛媛県": "380000", "高知県": "390000",
+    "福岡県": "400000", "佐賀県": "410000", "長崎県": "420000",
+    "熊本県": "430000", "大分県": "440000", "宮崎県": "450000",
+    "鹿児島県": "460100", "沖縄県": "471000",
+}
+
 
 def _place_core(place: str) -> str:
     return re.sub(r"(市|区|町|村|都|府|県)$", "", place)
@@ -650,7 +703,8 @@ def _table_place(place: str) -> dict | None:
         if entry is not None:
             name, admin1, lat, lon = entry
             return {"name": name, "admin1": admin1, "latitude": lat,
-                    "longitude": lon, "timezone": "Asia/Tokyo"}
+                    "longitude": lon, "timezone": "Asia/Tokyo",
+                    "jma_code": _JMA_CODES.get(key)}
     return None
 
 
@@ -722,41 +776,170 @@ async def _geocode_place(client: httpx.AsyncClient,
     return None
 
 
-async def fetch_weather(prompt: str) -> str | None:
-    """Authoritative daily forecast block for a local-weather
-    question, or None (caller falls back to web search)."""
-    if _WEATHER_NON_FORECAST_RE.search(prompt):
-        return None  # typhoons / earthquakes are news, not forecasts
-    place = _extract_place(prompt)
-    if place is None:
-        print(f"Weather: no place extracted from {prompt!r}")
-        return None
-    offset = _weather_day_offset(prompt)
+def _pick_jma_area(areas: list, core: str,
+                   hint: str | None) -> dict:
+    """Choose the sub-area of a JMA forecast region for a place:
+    a name containing the place core wins, then the hint, then
+    the first area (the main sub-area for most regions)."""
+    for area in areas:
+        if core and core in area["area"]["name"]:
+            return area
+    if hint:
+        for area in areas:
+            if hint in area["area"]["name"]:
+                return area
+    return areas[0]
+
+
+def _jma_int(value) -> int | None:
     try:
-        async with httpx.AsyncClient(timeout=10,
-                                     headers=_HTTP_HEADERS) as client:
-            top = await _geocode_place(client, place)
-            if top is None:
-                return None
-            name = top.get("name", "")
-            admin1 = top.get("admin1") or ""
-            fc = await client.get(
-                "https://api.open-meteo.com/v1/forecast",
-                params={
-                    "latitude": top["latitude"],
-                    "longitude": top["longitude"],
-                    "daily": ("weather_code,temperature_2m_max,"
-                              "temperature_2m_min,"
-                              "precipitation_probability_max,"
-                              "precipitation_sum"),
-                    "timezone": top.get("timezone") or "Asia/Tokyo",
-                    "forecast_days": 4,
-                })
-            fc.raise_for_status()
-            daily = fc.json()["daily"]
-    except Exception as exc:  # noqa: BLE001
-        print(f"Weather fetch failed: {exc}")
+        return int(value)
+    except (TypeError, ValueError):
         return None
+
+
+async def _jma_forecast_block(client: httpx.AsyncClient, code: str,
+                              core: str, name: str, admin1: str,
+                              offset: int) -> str | None:
+    """Daily forecast block from the Japan Meteorological Agency's
+    public forecast JSON (free, no key, official Japanese text).
+    Combines the short-term feed (weather wording, 6-hourly precip
+    probabilities, tomorrow's temps) with the weekly feed (daily
+    temps / probabilities for the remaining days)."""
+    resp = await client.get(
+        "https://www.jma.go.jp/bosai/forecast/data/forecast/"
+        f"{code}.json")
+    resp.raise_for_status()
+    data = resp.json()
+    short = data[0]
+    weekly = data[1] if len(data) > 1 else {}
+    hint = _JMA_AREA_HINT.get(core)
+    today = datetime.datetime.now(
+        zoneinfo.ZoneInfo("Asia/Tokyo")).date()
+
+    weather_ts = short["timeSeries"][0]
+    area = _pick_jma_area(weather_ts["areas"], core, hint)
+    area_name = area["area"]["name"]
+    days = []  # (date, weather text)
+    for td, text in zip(weather_ts["timeDefines"], area["weathers"]):
+        day = datetime.date.fromisoformat(td[:10])
+        text = re.sub(r"\s+", " ", text.replace("　", " ")).strip()
+        days.append((day, text))
+    if not days:
+        return None
+
+    pops: dict = {}
+    if len(short["timeSeries"]) > 1:
+        pop_ts = short["timeSeries"][1]
+        pop_area = next(
+            (a for a in pop_ts["areas"]
+             if a["area"]["name"] == area_name), pop_ts["areas"][0])
+        for td, pop in zip(pop_ts["timeDefines"], pop_area["pops"]):
+            value = _jma_int(pop)
+            if value is None:
+                continue
+            day = datetime.date.fromisoformat(td[:10])
+            pops[day] = max(pops.get(day, -1), value)
+
+    temps: dict = {}  # date -> [min, max]; first writer wins per slot
+
+    def note_temp(day, low, high):
+        slot = temps.setdefault(day, [None, None])
+        if low is not None and slot[0] is None:
+            slot[0] = low
+        if high is not None and slot[1] is None:
+            slot[1] = high
+
+    if len(short["timeSeries"]) > 2:
+        point = _pick_jma_area(short["timeSeries"][2]["areas"],
+                               core, None)
+        for td, value in zip(short["timeSeries"][2]["timeDefines"],
+                             point["temps"]):
+            day = datetime.date.fromisoformat(td[:10])
+            if int(td[11:13]) < 6:  # the 00:00 entry is the day's min
+                note_temp(day, _jma_int(value), None)
+            else:  # the 09:00 entry is the day's max
+                note_temp(day, None, _jma_int(value))
+    for ts in weekly.get("timeSeries", []):
+        areas = ts.get("areas") or []
+        if not areas:
+            continue
+        wk_area = next(
+            (a for a in areas if a["area"]["name"] == area_name),
+            areas[0])
+        if "pops" in wk_area:
+            for td, pop in zip(ts["timeDefines"], wk_area["pops"]):
+                day = datetime.date.fromisoformat(td[:10])
+                value = _jma_int(pop)
+                if value is not None and day not in pops:
+                    pops[day] = value
+        if "tempsMin" in wk_area:
+            for td, low, high in zip(ts["timeDefines"],
+                                     wk_area["tempsMin"],
+                                     wk_area["tempsMax"]):
+                note_temp(datetime.date.fromisoformat(td[:10]),
+                          _jma_int(low), _jma_int(high))
+
+    day_labels = ["今日", "明日", "明後日", "3日後"]
+    target = today + datetime.timedelta(days=offset)
+    lines = [f"{name}（{admin1}）の天気予報"
+             "（出典: 気象庁 https://www.jma.go.jp/ ）"]
+    for day, text in days[:3]:
+        diff = (day - today).days
+        label = day_labels[diff] if 0 <= diff < len(day_labels) else ""
+        low, high = temps.get(day, [None, None])
+        if low is not None and high is not None:
+            temp_text = f"最高 {high}℃ / 最低 {low}℃、"
+        elif high is not None:
+            temp_text = f"最高 {high}℃、"
+        elif low is not None:
+            temp_text = f"最低 {low}℃、"
+        else:
+            temp_text = ""
+        pop = pops.get(day)
+        pop_text = f"{pop}%" if pop is not None else "―"
+        marker = "（質問はこの日）" if day == target else ""
+        lines.append(f"- {label} {day:%m月%d日}：{text}、"
+                     f"{temp_text}降水確率 {pop_text}{marker}")
+    return "\n".join(lines)
+
+
+async def _try_jma(client: httpx.AsyncClient, code: str | None,
+                   core: str, name: str, admin1: str,
+                   offset: int) -> str | None:
+    if not code:
+        return None
+    try:
+        block = await _jma_forecast_block(client, code, core, name,
+                                          admin1, offset)
+        if block is not None:
+            print(f"Weather: JMA block for {name} ({code})")
+        return block
+    except Exception as exc:  # noqa: BLE001
+        print(f"Weather: JMA failed ({code}): {exc}")
+        return None
+
+
+async def _open_meteo_block(client: httpx.AsyncClient, top: dict,
+                            offset: int) -> str:
+    """Daily forecast block from Open-Meteo for a resolved place
+    dict (name / admin1 / latitude / longitude / timezone)."""
+    fc = await client.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude": top["latitude"],
+            "longitude": top["longitude"],
+            "daily": ("weather_code,temperature_2m_max,"
+                      "temperature_2m_min,"
+                      "precipitation_probability_max,"
+                      "precipitation_sum"),
+            "timezone": top.get("timezone") or "Asia/Tokyo",
+            "forecast_days": 4,
+        })
+    fc.raise_for_status()
+    daily = fc.json()["daily"]
+    name = top.get("name", "")
+    admin1 = top.get("admin1") or ""
     day_labels = ["今日", "明日", "明後日", "3日後"]
     lines = [f"{name}（{admin1}）の天気予報"
              "（出典: Open-Meteo https://open-meteo.com/ ）"]
@@ -772,6 +955,50 @@ async def fetch_weather(prompt: str) -> str | None:
             f"最低 {daily['temperature_2m_min'][i]:.0f}℃、"
             f"降水確率 {pop_text}{marker}")
     return "\n".join(lines)
+
+
+async def fetch_weather(prompt: str) -> str | None:
+    """Authoritative daily forecast block for a local-weather
+    question, or None (caller falls back to web search).
+
+    Source order is hedged across two independent providers: for
+    known major places the official JMA feed goes first and
+    Open-Meteo backs it up; anywhere else the geocoder +
+    Open-Meteo go first and the JMA prefecture feed backs them up.
+    """
+    if _WEATHER_NON_FORECAST_RE.search(prompt):
+        return None  # typhoons / earthquakes are news, not forecasts
+    place = _extract_place(prompt)
+    if place is None:
+        print(f"Weather: no place extracted from {prompt!r}")
+        return None
+    offset = _weather_day_offset(prompt)
+    core = _place_core(place)
+    async with httpx.AsyncClient(timeout=10,
+                                 headers=_HTTP_HEADERS) as client:
+        table = _table_place(place)
+        if table is not None:
+            block = await _try_jma(client, table.get("jma_code"),
+                                   core, table["name"],
+                                   table["admin1"], offset)
+            if block is not None:
+                return block
+            try:
+                return await _open_meteo_block(client, table, offset)
+            except Exception as exc:  # noqa: BLE001
+                print(f"Weather fetch failed: {exc}")
+                return None
+        top = await _geocode_place(client, place)
+        if top is None:
+            return None
+        try:
+            return await _open_meteo_block(client, top, offset)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Weather fetch failed: {exc}")
+        code = _PREFECTURE_JMA_CODES.get(top.get("admin1") or "")
+        return await _try_jma(client, code, core,
+                              top.get("name", place),
+                              top.get("admin1") or "", offset)
 
 
 _TICKER_RES = [
