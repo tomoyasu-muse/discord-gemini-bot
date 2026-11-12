@@ -33,14 +33,18 @@ Discord + Gemini API chat bot.
   normal answer; a Gemini rate limit (429) is reported as such instead.
 - Diet support (`diet.py`): run `/diet-setup` once per server; it
   creates a 「ダイエット記録」 channel where every record is stored as
-  a bot message (`DIETLOG|1|...`), so logs survive redeploys with no
-  database. Mention the bot with a meal photo (or text starting with
-  食べた/食事, or the `/meal` command) and Gemini estimates calories
-  and PFC and logs it; 「体重 68.4」 (or `/weight`) logs weight.
-  `/diet-goal` sets a target weight and daily calorie goal, `/today`
-  and `/week` summarise, and reminders post at 08:00 (weight) and
-  21:00 (missing logs; weekly summary on Sundays), switchable with
-  `/diet-remind`.
+  a bot message (`DIETLOG|1|...`) tagged with its user, so logs
+  survive redeploys with no database and stay separate per user.
+  Mention the bot with the food and calories written out
+  (「納豆ご飯 300kcal」) and the number is logged as-is; meals are
+  totalled per calendar day (00:00–24:00 JST) and each log reply
+  reports the day's intake against that user's daily goal. Without
+  calories, text starting with 食べた (or the `/meal` command) lets
+  Gemini estimate calories and PFC instead. 「体重 68.4」 (or
+  `/weight`) logs weight. `/diet-goal` sets a per-user target weight
+  and daily calorie goal, `/today` and `/week` summarise, and
+  reminders post at 08:00 (weight) and 21:00 (missing logs; weekly
+  summary on Sundays), switchable with `/diet-remind`.
 - Gemini is called via the google-genai SDK's async client
   (`client.aio`) and Tavily via `AsyncTavilyClient`, so API calls
   never block the Discord event loop.

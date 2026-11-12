@@ -17,10 +17,11 @@ Discord + Gemini AI chat bot.
   searches Tavily once, then asks Gemini once with the results.
   If search is unavailable, the bot falls back to a normal answer
   (except on rate limits, where it says so).
-- Diet support (diet.py): meal photos / text and weight mentions are
-  logged with Gemini-estimated calories; records persist as bot
-  messages in a per-guild 「ダイエット記録」 channel, with /today,
-  /week, /diet-goal and morning/evening reminders.
+- Diet support (diet.py): per-user meal / weight logging. Writing
+  the calories yourself (「納豆ご飯 300kcal」) records them as-is;
+  otherwise Gemini estimates from the meal text. Records persist as
+  bot messages in a per-guild 「ダイエット記録」 channel, with
+  /today, /week, /diet-goal and morning/evening reminders.
 - Gemini is called through the google-genai SDK's async client
   (client.aio) and Tavily through AsyncTavilyClient, so no call ever
   blocks the Discord event loop.
@@ -837,14 +838,12 @@ async def on_message(message: discord.Message):
 
     # --- Inside an active thread: continue the conversation ---
     if in_thread and message.channel.id in active_threads:
-        if not prompt and not message.attachments:
+        if not prompt:
             return
         diet_reply = await diet.try_handle(message, prompt)
         if diet_reply is not None:
             for chunk in split_message(diet_reply):
                 await message.channel.send(chunk, suppress_embeds=True)
-            return
-        if not prompt:
             return
         async with message.channel.typing():
             try:
@@ -863,7 +862,7 @@ async def on_message(message: discord.Message):
     if not mentioned:
         return
 
-    # --- Diet actions (meal photo / text, weight) come before chat ---
+    # --- Diet actions (meal / weight logging) come before chat ---
     diet_reply = await diet.try_handle(message, prompt)
     if diet_reply is not None:
         chunks = split_message(diet_reply)
