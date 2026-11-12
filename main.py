@@ -556,6 +556,111 @@ async def ask_gemini_search(prompt: str) -> str:
     return text
 
 
+# ---------------------------------------------------------------------------
+# Direct weather fetching (Open-Meteo: free, no API key)
+#
+# Search snippets from forecast portals structurally lose tomorrow's
+# numbers (the snippet shows today's hourly page), the same failure
+# mode as finance. So local-forecast questions fetch the numbers
+# directly: geocode the place, then read the daily forecast.
+# ---------------------------------------------------------------------------
+_WMO_DESCRIPTIONS = {
+    0: "快晴", 1: "晴れ", 2: "晴れ時々くもり", 3: "くもり",
+    45: "霧", 48: "霧", 51: "小雨", 53: "小雨", 55: "霧雨",
+    56: "凍る霧雨", 57: "凍る霧雨",
+    61: "雨", 63: "雨", 65: "大雨", 66: "凍雨", 67: "凍雨",
+    71: "雪", 73: "雪", 75: "大雪", 77: "あられ",
+    80: "にわか雨", 81: "にわか雨", 82: "激しいにわか雨",
+    85: "にわか雪", 86: "にわか雪",
+    95: "雷雨", 96: "雷雨（雹を伴う）", 99: "雷雨（雹を伴う）",
+}
+
+_WEATHER_STRIP_RE = re.compile(
+    r"明後日|明日|あした|今日|今夜|今朝|週末|天気予報|天気|気温|降水確率|"
+    r"最高気温|最低気温|予報|教えて|ください|ですか|ますか|でしょう|"
+    r"降る|降ります|は？|？|\?")
+_WEATHER_NON_FORECAST_RE = re.compile(r"台風|地震|津波")
+
+
+def _weather_day_offset(prompt: str) -> int:
+    if "明後日" in prompt:
+        return 2
+    if "明日" in prompt or "あした" in prompt:
+        return 1
+    return 0
+
+
+def _extract_place(prompt: str) -> str | None:
+    """Best-effort place name from a weather question: strip the
+    day words, weather words and question scaffolding, then trim
+    dangling particles. 「明日の大阪市の天気は？」 → 「大阪市」."""
+    text = _WEATHER_STRIP_RE.sub("", prompt)
+    text = re.sub(r"(は|の)?(雨|雪)$", "", text)
+    text = re.sub(r"^[のはをにへ、。\s]+", "", text)
+    text = re.sub(r"[のはをにへ、。\s]+$", "", text)
+    text = text.strip()
+    return text if 2 <= len(text) <= 12 else None
+
+
+async def fetch_weather(prompt: str) -> str | None:
+    """Authoritative daily forecast block for a local-weather
+    question, or None (caller falls back to web search)."""
+    if _WEATHER_NON_FORECAST_RE.search(prompt):
+        return None  # typhoons / earthquakes are news, not forecasts
+    place = _extract_place(prompt)
+    if place is None:
+        return None
+    offset = _weather_day_offset(prompt)
+    try:
+        async with httpx.AsyncClient(timeout=10,
+                                     headers=_HTTP_HEADERS) as client:
+            geo = await client.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={"name": place, "count": 1, "language": "ja",
+                        "format": "json"})
+            geo.raise_for_status()
+            results = geo.json().get("results") or []
+            if not results:
+                return None
+            top = results[0]
+            name = top.get("name", "")
+            admin1 = top.get("admin1") or ""
+            if not (place in name or name in place or place in admin1):
+                return None  # geocoder matched something unrelated
+            fc = await client.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": top["latitude"],
+                    "longitude": top["longitude"],
+                    "daily": ("weather_code,temperature_2m_max,"
+                              "temperature_2m_min,"
+                              "precipitation_probability_max,"
+                              "precipitation_sum"),
+                    "timezone": top.get("timezone") or "Asia/Tokyo",
+                    "forecast_days": 4,
+                })
+            fc.raise_for_status()
+            daily = fc.json()["daily"]
+    except Exception as exc:  # noqa: BLE001
+        print(f"Weather fetch failed: {exc}")
+        return None
+    day_labels = ["今日", "明日", "明後日", "3日後"]
+    lines = [f"{name}（{admin1}）の天気予報"
+             "（出典: Open-Meteo https://open-meteo.com/ ）"]
+    for i, date_str in enumerate(daily["time"][:4]):
+        day = datetime.date.fromisoformat(date_str)
+        desc = _WMO_DESCRIPTIONS.get(daily["weather_code"][i], "不明")
+        pop = daily["precipitation_probability_max"][i]
+        pop_text = f"{pop:.0f}%" if pop is not None else "―"
+        marker = "（質問はこの日）" if i == offset else ""
+        lines.append(
+            f"- {day_labels[i]} {day:%m月%d日}：{desc}、"
+            f"最高 {daily['temperature_2m_max'][i]:.0f}℃ / "
+            f"最低 {daily['temperature_2m_min'][i]:.0f}℃、"
+            f"降水確率 {pop_text}{marker}")
+    return "\n".join(lines)
+
+
 _TICKER_RES = [
     # TSE codes are 4 chars and may contain letters since 2024
     # (e.g. 167A), so digits alone are not enough.
@@ -664,9 +769,14 @@ async def ask_gemini_prefetch(prompt: str) -> str:
         elif FINANCE_PATTERN.search(prompt):
             results_text = await _prefetch_finance(prompt, sources)
         elif WEATHER_PATTERN.search(prompt):
-            # Restrict to forecast sites so past-weather records and
-            # unrelated pages do not pollute the answer.
-            results_text = await search_web(query, include_domains=WEATHER_DOMAINS)
+            # Local forecasts come from the Open-Meteo API directly
+            # (portal snippets lose tomorrow's numbers). Anything
+            # the direct fetch cannot handle falls back to a
+            # domain-restricted search of forecast sites.
+            results_text = await fetch_weather(prompt)
+            if results_text is None:
+                results_text = await search_web(
+                    query, include_domains=WEATHER_DOMAINS)
         else:
             results_text = await search_web(query)
     finally:

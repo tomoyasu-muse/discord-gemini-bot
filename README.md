@@ -21,7 +21,12 @@ Discord + Gemini API chat bot.
   source list it collected. Questions that clearly need real-time data
   (weather, FX rates, stock prices, news…) are auto-detected by a
   keyword regex — no 「調べて」 needed — and use a faster pre-fetch
-  route (Python searches Tavily once, then one Gemini call). For FX
+  route (Python searches Tavily once, then one Gemini call). Local
+  weather forecasts are also fetched directly, from the Open-Meteo
+  API (no key): the place is geocoded and the daily forecast
+  (today through 3 days ahead) is used as the answer's source, with
+  the domain-restricted portal search kept only as a fallback —
+  portal snippets structurally lose tomorrow's numbers. For FX
   rates, major indices and Bitcoin, no search is used at all: the
   number is fetched directly from Yahoo Finance's chart API (with a
   daily ExchangeRate-API fallback for currency pairs; generic FX
