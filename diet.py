@@ -36,8 +36,15 @@ visible (and editable) in Discord itself.
 Backup: when GITHUB_TOKEN and DIET_BACKUP_REPO are configured, all
 records are merged into a single diet_log.csv in that (private)
 repo once a day at 21:00 — a safety net in case the Discord
-channel is ever deleted. Merging is key-based, so restarts and
-re-runs never duplicate rows.
+channel is ever deleted. Rows are keyed by Discord message_id;
+the window covered by in-memory records is rewritten from memory
+(so /diet-undo deletions propagate) and older rows are kept.
+
+Access: the log channel starts hidden from @everyone. Each user
+who logs (or sets a goal) is granted read-only access to it, so
+reminder mentions there actually reach them and the shared log
+stays readable by its users. Reminder on/off is per user
+(/diet-remind), stored as a 'pref' line in the settings message.
 """
 
 import base64
@@ -80,7 +87,7 @@ BACKUP_PATH = "diet_log.csv"
 BACKUP_FIELDS = [
     "timestamp", "user_id", "type", "name", "kcal", "protein_g",
     "fat_g", "carbs_g", "kg", "target_kg", "daily_kcal", "manual",
-    "guild_id",
+    "guild_id", "message_id",
 ]
 
 _client = None
@@ -196,6 +203,19 @@ class GuildDiet:
 
     def remind_on(self) -> bool:
         return self.config().get("remind", "on") != "off"
+
+    def pref_record(self, user_id: int) -> dict | None:
+        prefs = self._mine(
+            [r for r in self.records if r["type"] == "pref"], user_id)
+        return prefs[-1] if prefs else None
+
+    def remind_pref(self, user_id: int) -> bool:
+        """Per-user reminder preference (default on). Stored as a
+        'pref' record in the settings message; the latest wins."""
+        pref = self.pref_record(user_id)
+        if pref is None:
+            return True
+        return pref["fields"].get("remind", "on") != "off"
 
     def meals_on(self, day: datetime.date, user_id: int) -> list[dict]:
         return self._mine([
@@ -335,7 +355,8 @@ def _push_local(state: GuildDiet, rtype: str, fields: dict,
 
 async def _save_settings(guild: discord.Guild, state: GuildDiet):
     """Rewrite the pinned settings message from current state:
-    one config line (merged) + each user's latest goal line."""
+    one config line (merged) + each user's latest goal line and
+    reminder-preference line."""
     channel = guild.get_channel(state.channel_id)
     if channel is None:
         return
@@ -349,6 +370,10 @@ async def _save_settings(guild: discord.Guild, state: GuildDiet):
         if goal is not None:
             lines.append(encode_record(
                 "goal", goal["ts"], goal["fields"], goal["text"]))
+        pref = state.pref_record(user_id)
+        if pref is not None:
+            lines.append(encode_record(
+                "pref", pref["ts"], pref["fields"], pref["text"]))
     content = "\n".join(lines)
     if state.settings_msg_id is not None:
         try:
@@ -742,11 +767,6 @@ async def _record_estimated(guild, state, user_id: int, est: dict,
 # ---------------------------------------------------------------------------
 # Daily backup to a GitHub repo (Contents API, merge by record key)
 # ---------------------------------------------------------------------------
-def _record_key(record: dict):
-    return (record["ts"].isoformat(), record["fields"].get("user", ""),
-            record["type"], record["text"])
-
-
 def _record_row(record: dict, guild_id: int) -> list:
     fields = record["fields"]
     return [
@@ -755,7 +775,17 @@ def _record_row(record: dict, guild_id: int) -> list:
         fields.get("f", ""), fields.get("c", ""), fields.get("kg", ""),
         fields.get("target_kg", ""), fields.get("daily_kcal", ""),
         fields.get("manual", ""), str(guild_id),
+        str(record.get("msg_id") or ""),
     ]
+
+
+def _parse_csv_rows(text: str) -> list[list]:
+    """Data rows of an existing backup CSV, normalised to the
+    current field count (older files may lack message_id)."""
+    rows = [row for row in csv.reader(io.StringIO(text)) if row]
+    if rows and rows[0] and rows[0][0] == "timestamp":
+        rows = rows[1:]
+    return [row + [""] * (len(BACKUP_FIELDS) - len(row)) for row in rows]
 
 
 def _csv_text(rows: list[list]) -> str:
@@ -764,16 +794,6 @@ def _csv_text(rows: list[list]) -> str:
     writer.writerow(BACKUP_FIELDS)
     writer.writerows(rows)
     return buffer.getvalue()
-
-
-def _existing_keys(csv_text: str) -> set:
-    keys = set()
-    reader = csv.reader(io.StringIO(csv_text))
-    for index, row in enumerate(reader):
-        if index == 0 or len(row) < 4:
-            continue
-        keys.add((row[0], row[1], row[2], row[3]))
-    return keys
 
 
 async def _gh_get_file(client: httpx.AsyncClient):
@@ -803,17 +823,42 @@ async def _gh_put_file(client: httpx.AsyncClient, content: str,
 
 async def backup_now() -> str:
     """Merge all in-memory records into the backup CSV (once per
-    day from the reminder loop). Returns a short status string."""
+    day from the reminder loop). Returns a short status string.
+
+    Merge rules (message_id is the primary key):
+    - goal rows are always refreshed from current state;
+    - meal/weight rows whose message_id is in memory are re-added
+      from memory;
+    - rows inside the time window covered by memory (from the
+      oldest in-memory record of that guild on) but NOT in memory
+      are dropped — that is how /diet-undo deletions propagate;
+    - older rows outside the window are kept untouched."""
     if not GITHUB_TOKEN or not BACKUP_REPO:
         return "disabled"
     all_records = []
+    window_start: dict[str, datetime.datetime] = {}
     for state in _states.values():
         if not state.loaded:
             continue
+        if state.channel_id is not None and not any(
+                r["type"] in ("meal", "weight") for r in state.records):
+            # Set up but currently holding no records at all: every
+            # backed-up meal/weight row of this guild was undone.
+            window_start[str(state.guild_id)] = \
+                datetime.datetime.min.replace(tzinfo=JST)
         for record in state.records:
             if record["type"] in ("meal", "weight", "goal"):
                 all_records.append((record, state.guild_id))
+                if record["type"] in ("meal", "weight"):
+                    key = str(state.guild_id)
+                    if key not in window_start \
+                            or record["ts"] < window_start[key]:
+                        window_start[key] = record["ts"]
     all_records.sort(key=lambda pair: pair[0]["ts"])
+    memory_rows = [_record_row(r, gid) for r, gid in all_records]
+    memory_ids = {row[13] for row in memory_rows if row[13]}
+    goal_keys = {(row[12], row[1]) for row in memory_rows
+                 if row[2] == "goal"}
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json",
@@ -823,33 +868,60 @@ async def backup_now() -> str:
         for attempt in range(2):
             existing, sha = await _gh_get_file(client)
             if existing is None:
-                rows = [_record_row(r, gid) for r, gid in all_records]
-                await _gh_put_file(client, _csv_text(rows), None)
-                return f"created with {len(rows)} records"
-            keys = _existing_keys(existing)
-            new_rows = [
-                _record_row(r, gid) for r, gid in all_records
-                if _record_key(r) not in keys
-            ]
-            if not new_rows:
+                await _gh_put_file(client, _csv_text(memory_rows), None)
+                return f"created with {len(memory_rows)} records"
+            kept = []
+            for row in _parse_csv_rows(existing):
+                if row[2] == "goal":
+                    if (row[12], row[1]) not in goal_keys:
+                        kept.append(row)
+                    continue
+                if row[13] and row[13] in memory_ids:
+                    continue  # re-added from memory below
+                start = window_start.get(row[12])
+                if start is not None:
+                    try:
+                        row_ts = datetime.datetime.fromisoformat(row[0])
+                    except ValueError:
+                        row_ts = None
+                    if row_ts is not None and row_ts >= start:
+                        continue  # in covered window but gone = undone
+                kept.append(row)
+            merged = kept + memory_rows
+            merged.sort(key=lambda row: row[0])
+            merged_text = _csv_text(merged)
+            if merged_text == _csv_text(_parse_csv_rows(existing)):
                 return "up-to-date"
-            # Rebuild through the csv module so quoting is always
-            # correct.
-            buffer = io.StringIO(existing)
-            existing_rows = list(csv.reader(buffer))
-            out = io.StringIO()
-            writer = csv.writer(out)
-            writer.writerows(existing_rows)
-            writer.writerows(new_rows)
-            merged = out.getvalue()
             try:
-                await _gh_put_file(client, merged, sha)
-                return f"appended {len(new_rows)} records"
+                await _gh_put_file(client, merged_text, sha)
+                return f"saved {len(merged)} records"
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code in (409, 422) and attempt == 0:
                     continue  # sha moved; re-read and merge again
                 raise
     return "failed"
+
+
+async def _ensure_user_access(guild: discord.Guild, state: GuildDiet,
+                              user) -> None:
+    """Give a diet user read access to the log channel: reminders
+    mention users there and the shared log is meant to be readable
+    by the people logging in it. Read-only (no posting). Best
+    effort — without permission to edit channel overwrites this
+    quietly does nothing and admins are unaffected."""
+    try:
+        if state.channel_id is None:
+            return
+        channel = guild.get_channel(state.channel_id)
+        if channel is None:
+            return
+        if channel.permissions_for(user).view_channel:
+            return
+        await channel.set_permissions(
+            user, view_channel=True, read_message_history=True,
+            send_messages=False)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Diet log access grant failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -882,7 +954,8 @@ def register(bot: commands.Bot):
             guild.default_role: discord.PermissionOverwrite(read_messages=False),
             guild.me: discord.PermissionOverwrite(
                 read_messages=True, send_messages=True,
-                read_message_history=True, manage_messages=True
+                read_message_history=True, manage_messages=True,
+                manage_permissions=True
             ),
         }
         try:
@@ -910,8 +983,10 @@ def register(bot: commands.Bot):
             "- 目標： /diet-goal で目標体重と1日の目標カロリーを設定\n"
             "- 集計： /today（今日）・/week（直近7日）。1日は朝4時〜翌朝4時で集計します（深夜4時までの夜食は前日分）\n"
             "- 取り消し： /diet-undo で直前の食事・体重の記録を1件削除できます\n"
-            "- リマインド： 朝8時に体重、夜21時に記録もれの声かけ（/diet-remind で切替）"
+            "- リマインド： 朝8時に体重、夜21時に記録もれの声かけ（/diet-remind で自分の分だけ切替）\n"
+            "- このチャンネルは記録した人にだけ自動で閲覧権限が付きます（見るだけ・投稿はできません）"
         )
+        await _ensure_user_access(guild, state, interaction.user)
         await interaction.followup.send(
             f"記録チャンネル {channel.mention} を作りました。"
             "次に /diet-goal で目標を設定すると、残りカロリーや目標までの差も出せます。"
@@ -939,6 +1014,7 @@ def register(bot: commands.Bot):
             fields["start_kg"] = f"{_f(latest['fields'], 'kg'):.1f}"
         _push_local(state, "goal", fields, user_id=interaction.user.id)
         await _save_settings(guild, state)
+        await _ensure_user_access(guild, state, interaction.user)
         msg = f"🎯 目標を設定しました： {target_kg:.1f} kg"
         if daily_kcal:
             msg += f" / 1日 {int(daily_kcal)} kcal"
@@ -960,6 +1036,7 @@ def register(bot: commands.Bot):
             await interaction.response.send_message(
                 SETUP_HINT, ephemeral=True)
             return
+        await _ensure_user_access(guild, state, interaction.user)
         await interaction.response.defer(thinking=True)
         parsed = parse_meal_input(text)
         if parsed:
@@ -1017,6 +1094,7 @@ def register(bot: commands.Bot):
             await interaction.response.send_message(
                 "体重の数値が範囲外のようです。", ephemeral=True)
             return
+        await _ensure_user_access(guild, state, interaction.user)
         prev = state.latest_weight(interaction.user.id)
         now = datetime.datetime.now(JST)
         display = (f"⚖️ {now:%H:%M} {interaction.user.display_name}："
@@ -1104,7 +1182,7 @@ def register(bot: commands.Bot):
         await interaction.response.send_message(
             week_summary(state, interaction.user.id))
 
-    @tree.command(name="diet-remind", description="朝・夜のリマインドのオン/オフ")
+    @tree.command(name="diet-remind", description="自分の朝・夜リマインドのオン/オフ")
     @app_commands.describe(on_off="on または off")
     @app_commands.choices(on_off=[
         app_commands.Choice(name="on", value="on"),
@@ -1121,10 +1199,12 @@ def register(bot: commands.Bot):
             await interaction.response.send_message(
                 SETUP_HINT, ephemeral=True)
             return
-        _push_local(state, "config", {"remind": on_off})
+        _push_local(state, "pref", {"remind": on_off},
+                    user_id=interaction.user.id)
         await _save_settings(guild, state)
         await interaction.response.send_message(
-            f"リマインドを {on_off} にしました。")
+            f"あなたのリマインドを {on_off} にしました。"
+            "（他の人の設定には影響しません）")
 
 
 # ---------------------------------------------------------------------------
@@ -1153,13 +1233,15 @@ async def _reminder_loop():
         if key in _reminded:
             continue
         state = await _ensure_loaded(guild)
-        if state.channel_id is None or not state.remind_on():
+        if state.channel_id is None:
             continue
         channel = guild.get_channel(state.channel_id)
         if channel is None:
             continue
         _reminded.add(key)
         for user_id in state.users():
+            if not state.remind_pref(user_id):
+                continue
             try:
                 if kind == "morning":
                     latest = state.latest_weight(user_id)

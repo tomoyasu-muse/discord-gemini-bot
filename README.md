@@ -24,11 +24,14 @@ Discord + Gemini API chat bot.
   route (Python searches Tavily once, then one Gemini call). For FX
   rates, major indices and Bitcoin, no search is used at all: the
   number is fetched directly from Yahoo Finance's chart API (with a
-  daily ExchangeRate-API fallback for currency pairs). Stock questions
-  use a domain-restricted Tavily search (kabutan.jp,
-  finance.yahoo.co.jp, minkabu.jp) with raw page content, and when a
-  ticker code can be identified from the result URLs, the same chart
-  API provides the authoritative price. Tavily's free plan allows 1,000 credits/month and needs no credit card. If a
+  daily ExchangeRate-API fallback for currency pairs; generic FX
+  words — 為替・円安・円高 — use USD/JPY as the representative
+  pair). An explicitly named US ticker (「NVDAの株価」) is also
+  fetched directly. Other stock questions use a domain-restricted
+  Tavily search (kabutan.jp, finance.yahoo.co.jp, minkabu.jp) with
+  raw page content, and when a ticker code can be identified from
+  the result URLs (4-char codes, letters included, e.g. 167A), the
+  same chart API provides the authoritative price. Tavily's free plan allows 1,000 credits/month and needs no credit card. If a
   search fails (or no API key is configured), the bot falls back to a
   normal answer; a Gemini rate limit (429) is reported as such instead.
 - Diet support (`diet.py`): run `/diet-setup` once per server; it
@@ -43,7 +46,10 @@ Discord + Gemini API chat bot.
   the caller's most recent meal/weight record (message included).
   When `GITHUB_TOKEN` and `DIET_BACKUP_REPO` are set, all records
   are merged into `diet_log.csv` in that repo once a day at 21:00
-  as a backup against channel deletion.
+  as a backup against channel deletion (rows keyed by message_id;
+  the in-memory window is rewritten, so undone records disappear).
+  The log channel is hidden from @everyone; each user who logs is
+  granted read-only access to it automatically.
   Diet actions are slash commands only (mentions stay purely for
   questions). With `/gohan`, write the food and calories
   (「納豆ご飯 300kcal」) and the numbers are logged as-is; the
@@ -57,7 +63,7 @@ Discord + Gemini API chat bot.
   `/weight` logs weight. `/diet-goal` sets a per-user target weight
   and daily calorie goal, `/today` and `/week` summarise, and
   reminders post at 08:00 (weight) and 21:00 (missing logs; weekly
-  summary on Sundays), switchable with `/diet-remind`.
+  summary on Sundays), switchable per user with `/diet-remind`.
 - Gemini is called via the google-genai SDK's async client
   (`client.aio`) and Tavily via `AsyncTavilyClient`, so API calls
   never block the Discord event loop.

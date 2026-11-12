@@ -240,6 +240,11 @@ DIRECT_SYMBOLS = [
      "https://finance.yahoo.com/quote/%5EIXIC", None),
     (r"S&P|Ｓ＆Ｐ|SP500", "^GSPC", "S&P 500",
      "https://finance.yahoo.com/quote/%5EGSPC", None),
+    # Generic FX words only (no specific pair named): answer with
+    # USD/JPY as the representative pair. Kept last so the specific
+    # pairs above always win.
+    (r"為替|円安|円高", "USDJPY=X", "ドル円（USD/JPY）",
+     "https://finance.yahoo.co.jp/quote/USDJPY=FX", ("USD", "JPY")),
 ]
 DIRECT_SYMBOL_RES = [(re.compile(pat), t, lbl, url, pair)
                      for pat, t, lbl, url, pair in DIRECT_SYMBOLS]
@@ -552,11 +557,17 @@ async def ask_gemini_search(prompt: str) -> str:
 
 
 _TICKER_RES = [
-    (re.compile(r"kabutan\.jp/stock/\?code=(\d{4})"), "{}.T"),
-    (re.compile(r"finance\.yahoo\.co\.jp/quote/(\d{4})\.T"), "{}.T"),
-    (re.compile(r"minkabu\.jp/stock/(\d{4})"), "{}.T"),
+    # TSE codes are 4 chars and may contain letters since 2024
+    # (e.g. 167A), so digits alone are not enough.
+    (re.compile(r"kabutan\.jp/stock/\?code=([0-9A-Z]{4})"), "{}.T"),
+    (re.compile(r"finance\.yahoo\.co\.jp/quote/([0-9A-Z]{4})\.T"), "{}.T"),
+    (re.compile(r"minkabu\.jp/stock/([0-9A-Z]{4})"), "{}.T"),
     (re.compile(r"kabutan\.jp/stock_us/\?code=([A-Z]{1,6})"), "{}"),
 ]
+
+# An explicitly named US ticker: 「NVDAの株価」「ティッカー: AAPL」.
+_US_TICKER_RE = re.compile(
+    r"([A-Za-z]{2,5})の株価|ティッカー[:：]?\s*([A-Za-z]{1,5})")
 
 
 def _extract_ticker(sources: list) -> str | None:
@@ -566,7 +577,12 @@ def _extract_ticker(sources: list) -> str | None:
         for pattern, fmt in _TICKER_RES:
             match = pattern.search(url)
             if match:
-                return fmt.format(match.group(1))
+                code = match.group(1)
+                # A JP code always contains at least one digit;
+                # this keeps stray letter sequences out.
+                if fmt == "{}.T" and not any(c.isdigit() for c in code):
+                    continue
+                return fmt.format(code)
     return None
 
 
@@ -580,6 +596,16 @@ async def _prefetch_finance(prompt: str, sources: list) -> str:
     identified from the result URLs, an authoritative Yahoo Finance
     quote replaces the search text.
     """
+    # An explicitly named US ticker needs no search at all: fetch
+    # it directly (zero Tavily credits). A failed fetch falls
+    # through to the normal search route.
+    ticker_match = _US_TICKER_RE.search(prompt)
+    if ticker_match:
+        us_ticker = (ticker_match.group(1) or ticker_match.group(2)).upper()
+        quote = await fetch_quote(us_ticker)
+        if quote is not None:
+            url = f"https://finance.yahoo.com/quote/{us_ticker}"
+            return _quote_block(f"{us_ticker} の株価", url, quote)
     q = prompt.replace("？", "").replace("?", "").strip()
     q = re.sub(r"(は|を)?(教えて|ください)$", "", q).strip()
     if "現在値" not in q:
