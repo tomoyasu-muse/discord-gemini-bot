@@ -17,6 +17,10 @@ Discord + Gemini AI chat bot.
   searches Tavily once, then asks Gemini once with the results.
   If search is unavailable, the bot falls back to a normal answer
   (except on rate limits, where it says so).
+- Diet support (diet.py): meal photos / text and weight mentions are
+  logged with Gemini-estimated calories; records persist as bot
+  messages in a per-guild 「ダイエット記録」 channel, with /today,
+  /week, /diet-goal and morning/evening reminders.
 - Gemini is called through the google-genai SDK's async client
   (client.aio) and Tavily through AsyncTavilyClient, so no call ever
   blocks the Discord event loop.
@@ -39,6 +43,8 @@ from flask import Flask
 from google import genai
 from google.genai import types
 from tavily import AsyncTavilyClient
+
+import diet
 
 # ---------------------------------------------------------------------------
 # keep_alive (Render free-tier sleep workaround)
@@ -80,6 +86,8 @@ TEST_GUILD_ID = 1570294742137176134
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 tavily_client = AsyncTavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
+
+diet.configure(gemini_client, GEMINI_MODEL)
 
 RATE_LIMIT_MESSAGE = (
     "⚠️ いま少し混み合っています（Geminiの無料枠の上限に達しました）。"
@@ -710,6 +718,8 @@ intents.message_content = True  # Requires "Message Content Intent" in the porta
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+diet.register(bot)
+
 # Threads this bot is actively conversing in
 active_threads: set[int] = set()
 
@@ -720,6 +730,7 @@ _commands_synced = False
 async def on_ready():
     global _commands_synced
     print(f"Logged in as {bot.user} (id={bot.user.id})")
+    diet.start_reminders()
     if _commands_synced:
         return
     _commands_synced = True
@@ -826,6 +837,13 @@ async def on_message(message: discord.Message):
 
     # --- Inside an active thread: continue the conversation ---
     if in_thread and message.channel.id in active_threads:
+        if not prompt and not message.attachments:
+            return
+        diet_reply = await diet.try_handle(message, prompt)
+        if diet_reply is not None:
+            for chunk in split_message(diet_reply):
+                await message.channel.send(chunk, suppress_embeds=True)
+            return
         if not prompt:
             return
         async with message.channel.typing():
@@ -843,6 +861,15 @@ async def on_message(message: discord.Message):
 
     # Everything below needs a mention
     if not mentioned:
+        return
+
+    # --- Diet actions (meal photo / text, weight) come before chat ---
+    diet_reply = await diet.try_handle(message, prompt)
+    if diet_reply is not None:
+        chunks = split_message(diet_reply)
+        await message.reply(chunks[0], mention_author=False, suppress_embeds=True)
+        for chunk in chunks[1:]:
+            await message.channel.send(chunk, suppress_embeds=True)
         return
 
     if not prompt:

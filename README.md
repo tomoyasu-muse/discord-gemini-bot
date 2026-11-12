@@ -31,6 +31,16 @@ Discord + Gemini API chat bot.
   API provides the authoritative price. Tavily's free plan allows 1,000 credits/month and needs no credit card. If a
   search fails (or no API key is configured), the bot falls back to a
   normal answer; a Gemini rate limit (429) is reported as such instead.
+- Diet support (`diet.py`): run `/diet-setup` once per server; it
+  creates a 「ダイエット記録」 channel where every record is stored as
+  a bot message (`DIETLOG|1|...`), so logs survive redeploys with no
+  database. Mention the bot with a meal photo (or text starting with
+  食べた/食事, or the `/meal` command) and Gemini estimates calories
+  and PFC and logs it; 「体重 68.4」 (or `/weight`) logs weight.
+  `/diet-goal` sets a target weight and daily calorie goal, `/today`
+  and `/week` summarise, and reminders post at 08:00 (weight) and
+  21:00 (missing logs; weekly summary on Sundays), switchable with
+  `/diet-remind`.
 - Gemini is called via the google-genai SDK's async client
   (`client.aio`) and Tavily via `AsyncTavilyClient`, so API calls
   never block the Discord event loop.
