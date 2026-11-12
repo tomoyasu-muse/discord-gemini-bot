@@ -18,11 +18,13 @@ Discord + Gemini AI chat bot.
   If search is unavailable, the bot falls back to a normal answer
   (except on rate limits, where it says so).
 - Diet support (diet.py): per-user meal / weight logging through
-  slash commands only (/gohan, /weight, /diet-goal, /today, /week) —
-  mentions stay purely for questions. Writing the calories yourself
-  records them as-is; otherwise Gemini estimates from the meal text.
-  Records persist as bot messages in a per-guild 「ダイエット記録」
-  channel, with morning/evening reminders.
+  slash commands only (/gohan, /weight, /diet-goal, /today, /week,
+  /diet-undo) — mentions stay purely for questions. Writing the
+  calories yourself records them as-is; otherwise Gemini estimates
+  from the meal text. Records persist as bot messages in a
+  per-guild 「ダイエット記録」 channel (settings in one pinned
+  message), with morning/evening reminders and an optional daily
+  CSV backup to a GitHub repo.
 - Gemini is called through the google-genai SDK's async client
   (client.aio) and Tavily through AsyncTavilyClient, so no call ever
   blocks the Discord event loop.
@@ -732,7 +734,9 @@ _commands_synced = False
 async def on_ready():
     global _commands_synced
     print(f"Logged in as {bot.user} (id={bot.user.id})")
-    diet.start_reminders()
+    # Preload diet state for all guilds in the background (fast first
+    # commands, reliable 8:00 reminders), then start the reminder loop.
+    bot.loop.create_task(diet.preload_and_start())
     if _commands_synced:
         return
     _commands_synced = True

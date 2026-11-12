@@ -32,9 +32,16 @@ Discord + Gemini API chat bot.
   search fails (or no API key is configured), the bot falls back to a
   normal answer; a Gemini rate limit (429) is reported as such instead.
 - Diet support (`diet.py`): run `/diet-setup` once per server; it
-  creates a 「ダイエット記録」 channel where every record is stored as
-  a bot message (`DIETLOG|1|...`) tagged with its user, so logs
-  survive redeploys with no database and stay separate per user.
+  creates a 「ダイエット記録」 channel. Meal/weight records are
+  stored as bot messages (`DIETLOG|1|...`) tagged with their user,
+  while settings (config + goals) live in one pinned `DIETSET`
+  message edited in place, so they never fall out of the history
+  window. State is preloaded on startup; logs survive redeploys
+  with no database and stay separate per user. `/diet-undo` deletes
+  the caller's most recent meal/weight record (message included).
+  When `GITHUB_TOKEN` and `DIET_BACKUP_REPO` are set, all records
+  are merged into `diet_log.csv` in that repo once a day at 21:00
+  as a backup against channel deletion.
   Diet actions are slash commands only (mentions stay purely for
   questions). With `/gohan`, write the food and calories
   (「納豆ご飯 300kcal」) and the numbers are logged as-is; the
@@ -58,6 +65,9 @@ Discord + Gemini API chat bot.
 - `GEMINI_API_KEY` — Gemini API key from Google AI Studio
 - `GEMINI_MODEL` — optional, defaults to `gemini-3.5-flash-lite`
 - `TAVILY_API_KEY` — Tavily API key (free plan), needed for search
+- `GITHUB_TOKEN` / `DIET_BACKUP_REPO` — optional; a fine-grained
+  token (Contents read/write on the backup repo only) and the repo
+  as `owner/repo`, enabling the daily diet-log CSV backup
 - `PORT` — optional, defaults to `8080` (Render sets this automatically)
 
 ## Run on Render
