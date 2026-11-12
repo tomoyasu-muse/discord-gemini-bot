@@ -104,18 +104,29 @@ async def ask_gemini_once(prompt: str) -> str:
 # --- Search (Tavily tools driven by Gemini automatic function calling) ---
 SEARCH_TRIGGER_RE = re.compile(r"^(調べて|検索して)[\s:：、]*")
 
-SEARCH_SYSTEM_INSTRUCTION = (
-    "あなたはWeb検索ツールを使って最新情報を調べるアシスタントです。"
-    "回答する前に、必ず search_web ツールで検索してください。"
-    "検索結果のスニペットだけでは情報が不十分な場合は、extract_page ツールで"
-    "該当ページの全文を読んでから答えてください。"
-    "ニュース・今日・最新の話題を聞かれた場合は、search_web で topic='news' と"
-    "time_range='day'（取れなければ 'week'）を指定し、古い日付の記事を"
-    "「今日のニュース」として扱わないでください。"
-    "事実に関する主張には、根拠となったページのURLを引用として必ず含めてください。"
-    "URLはツールの結果に実際に含まれるものだけを使い、存在しないURLを創作してはいけません。"
-    "回答は日本語で簡潔にまとめてください。"
-)
+_WEEKDAYS_JA = ["月", "火", "水", "木", "金", "土", "日"]
+
+
+def build_search_system_instruction() -> str:
+    """System instruction for search answers, with the current JST
+    date/time baked in so the model builds recency-aware queries."""
+    now = datetime.datetime.now(zoneinfo.ZoneInfo("Asia/Tokyo"))
+    now_str = f"{now:%Y年%m月%d日}（{_WEEKDAYS_JA[now.weekday()]}）{now:%H:%M}"
+    return (
+        f"現在の日時は {now_str}（日本時間）です。"
+        "あなたはWeb検索ツールを使って最新情報を調べるアシスタントです。"
+        "回答する前に、必ず検索ツールで検索してください。"
+        "「最新」「今日」「直近」などの質問では、現在日時を基準に検索し、"
+        "古い情報を最新として扱わないでください。"
+        "ニュースや時事の話題には search_news ツール（ニュース専用・新しい順）を、"
+        "それ以外の調べものには search_web ツールを使ってください。"
+        "検索結果のスニペットだけでは情報が不十分な場合は、extract_page ツールで"
+        "該当ページの全文を読んでから答えてください。"
+        "記事の公開日を確認し、古い日付の記事は最新の話題として扱わないでください。"
+        "事実に関する主張には、根拠となったページのURLを引用として必ず含めてください。"
+        "URLはツールの結果に実際に含まれるものだけを使い、存在しないURLを創作してはいけません。"
+        "回答は日本語で簡潔にまとめてください。"
+    )
 
 # URLs actually returned by the tools during the current search request:
 # list of (title, url). Used to append a guaranteed-real source list.
@@ -167,6 +178,21 @@ def _tavily_search_sync(
     return data.get("results", [])
 
 
+def _format_results(results: list[dict]) -> str:
+    """Format Tavily results for the model, including publish dates
+    when available so it can judge freshness itself."""
+    parts = []
+    for index, result in enumerate(results, start=1):
+        title = result.get("title") or "(no title)"
+        url = result.get("url") or ""
+        content = (result.get("content") or "")[:600]
+        _collect_source(title, url)
+        published = result.get("published_date")
+        date_line = f"公開日: {published}\n" if published else ""
+        parts.append(f"[{index}] {title}\n{date_line}{url}\n{content}")
+    return "\n\n".join(parts)
+
+
 def search_web(
     query: str,
     search_depth: str = "basic",
@@ -197,14 +223,31 @@ def search_web(
     results = _tavily_search_sync(query, search_depth, topic, time_range)
     if not results:
         return "検索結果は見つかりませんでした。クエリを変えて再検索できます。"
-    parts = []
-    for index, result in enumerate(results, start=1):
-        title = result.get("title") or "(no title)"
-        url = result.get("url") or ""
-        content = (result.get("content") or "")[:600]
-        _collect_source(title, url)
-        parts.append(f"[{index}] {title}\n{url}\n{content}")
-    return "\n\n".join(parts)
+    return _format_results(results)
+
+
+def search_news(query: str, days: int = 3) -> str:
+    """Search recent news (news sources only, newest first).
+
+    Args:
+        query: What to search for.
+        days: Only include articles from the last this many days
+            (default 3). Widen it if nothing is found.
+
+    Returns:
+        News results as text: title, published date, URL and a
+        snippet per result.
+    """
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        days = 3
+    days = max(1, min(days, 31))
+    time_range = "day" if days <= 1 else "week" if days <= 7 else "month"
+    results = _tavily_search_sync(query, "basic", "news", time_range)
+    if not results:
+        return "該当する最新ニュースが見つかりませんでした。daysを広げて再検索できます。"
+    return _format_results(results)
 
 
 def extract_page(url: str) -> str:
@@ -238,13 +281,11 @@ async def ask_gemini_search(prompt: str) -> str:
     try:
         model = genai.GenerativeModel(
             GEMINI_MODEL,
-            system_instruction=SEARCH_SYSTEM_INSTRUCTION,
-            tools=[search_web, extract_page],
+            system_instruction=build_search_system_instruction(),
+            tools=[search_web, search_news, extract_page],
         )
         chat = model.start_chat(history=[], enable_automatic_function_calling=True)
-        today = datetime.datetime.now(zoneinfo.ZoneInfo("Asia/Tokyo")).date()
-        dated_prompt = f"（今日は {today.isoformat()} です）\n{prompt}"
-        response = await asyncio.to_thread(chat.send_message, dated_prompt)
+        response = await asyncio.to_thread(chat.send_message, prompt)
     finally:
         _current_sources.reset(token)
     try:
