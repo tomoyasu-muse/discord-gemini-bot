@@ -211,6 +211,8 @@ def build_prefetch_system_instruction() -> str:
     return (
         f"現在の日時は {now_str_jst()}（日本時間）です。"
         "ユーザーの質問と、それに対するWeb検索結果が渡されます。"
+        "あなたには検索結果が渡されているので、「リアルタイムデータにアクセスできない」"
+        "とは言わず、検索結果に基づいて答えてください。"
         "天気・為替・株価などのリアルタイムな情報は、検索結果の内容を優先して答えてください。"
         "もし検索結果に質問と関係ない情報しかない場合は、検索結果を無視して"
         "一般的な知識で普通に答えてください。"
@@ -412,9 +414,14 @@ async def ask_gemini_prefetch(prompt: str) -> str:
         if NEWS_PATTERN.search(prompt):
             results_text = await search_news(prompt, days=3)
         elif FINANCE_PATTERN.search(prompt):
-            # Tavily's finance topic returns quote pages with actual
-            # current values, unlike general search's outlook articles.
-            results_text = await search_web(query, topic="finance")
+            # Tavily's finance topic is tuned for financial queries and
+            # can return zero results for natural-language questions
+            # (observed live: 「今のドル円は？」 returned nothing and the
+            # model answered as if it had no data). Retry with general
+            # search before giving up.
+            results_text = await search_web(prompt, topic="finance")
+            if results_text.startswith("検索結果は見つかりませんでした"):
+                results_text = await search_web(query)
         elif WEATHER_PATTERN.search(prompt):
             # Restrict to forecast sites so past-weather records and
             # unrelated pages do not pollute the answer.
